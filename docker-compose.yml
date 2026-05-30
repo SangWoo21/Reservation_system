@@ -1,0 +1,64 @@
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=reservation123!
+      - MYSQL_DATABASE=ticketing
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  localstack:
+    image: localstack/localstack:3.4.0
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs
+
+  sqs-init:
+    image: amazon/aws-cli
+    depends_on:
+      - localstack
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - ./init-sqs.sh:/init-sqs.sh
+    entrypoint: ["/bin/sh", "-c", "chmod +x /init-sqs.sh && /init-sqs.sh"]
+
+  server:
+    build: .
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      sqs-init:
+        condition: service_completed_successfully
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/ticketing?createDatabaseIfNotExist=true&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+      - SPRING_DATASOURCE_USERNAME=root
+      - SPRING_DATASOURCE_PASSWORD=reservation123!
+      - SPRING_PROFILES_ACTIVE=local
+      - SPRING_DATA_REDIS_HOST=redis
+      - SPRING_DATA_REDIS_PORT=6379
+      - SPRING_CLOUD_AWS_CREDENTIALS_ACCESSKEY=test
+      - SPRING_CLOUD_AWS_CREDENTIALS_SECRETKEY=test
+      - SPRING_CLOUD_AWS_REGION_STATIC=us-east-1
+      - SPRING_CLOUD_AWS_SQS_ENDPOINT=http://localstack:4566
+      - CLOUD_AWS_SQS_QUEUE_URL=http://localstack:4566/000000000000/waiting-process-queue
+      - CLOUD_AWS_SQS_LIFECYCLE_HOOK_QUEUE_URL=http://localstack:4566/000000000000/lifecycle-hook-queue
