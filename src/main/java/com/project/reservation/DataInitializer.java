@@ -1,7 +1,7 @@
 package com.project.reservation;
 
-import com.project.reservation.domain.Seat;
-import com.project.reservation.repository.SeatRepository;
+import com.project.reservation.transaction.domain.Seat;
+import com.project.reservation.transaction.repository.SeatRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
