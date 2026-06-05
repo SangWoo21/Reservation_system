@@ -23,6 +23,8 @@ spring:
       host: ${SPRING_DATA_REDIS_HOST}
       port: ${SPRING_DATA_REDIS_PORT:6379}
       timeout: 3000
+      ssl:
+        enabled: true
       lettuce:
         pool:
           max-active: 10

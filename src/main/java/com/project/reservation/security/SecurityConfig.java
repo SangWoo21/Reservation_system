@@ -21,11 +21,6 @@ public class SecurityConfig {
                 .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
             )
 
-            // HTTPS 강제 - CloudFront에서 X-Forwarded-Proto 헤더로 처리 (슬라이드 ⑦번)
-            .requiresChannel(channel -> channel
-                .anyRequest().requiresSecure()
-            )
-
             // 보안 헤더
             .headers(headers -> headers
                 .xssProtection(xss -> xss
