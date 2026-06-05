@@ -22,8 +22,11 @@ public class LifecycleHookConsumer {
         log.info("[LifecycleHook] 수신: {}", message);
 
         if (message.contains("autoscaling:EC2_INSTANCE_LAUNCHING")) {
-            // scale-out 시작 → Queue① 활성화 (TTL 내 자동 만료)
-            queue1Service.activate();
+            if (queue1Service.isAutoEnabled()) {
+                queue1Service.activate();
+            } else {
+                log.info("[LifecycleHook] auto-enabled OFF — Queue1 활성화 건너뜀 (Warm Pool 페이즈)");
+            }
         } else if (message.contains("autoscaling:EC2_INSTANCE_TERMINATING")) {
             // scale-in 시작 → Queue① 비활성화
             queue1Service.deactivate();
