@@ -1,7 +1,11 @@
 package com.project.reservation.waiting_redis.service;
 
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -26,6 +30,9 @@ public class WaitingService {
     @Value("${cloud.aws.sqs.queue-url}")
     private String queueUrl;
 
+    @Value("${hmac.secret.key}")
+    private String hmacSecretKey;
+
     private static final long MAX_CAPACITY = 1000L;
 
     public WaitingsApiResponse<?> addWaitingQueue(String userId) {
@@ -49,7 +56,8 @@ public class WaitingService {
         }
 
         Long rank = redisTemplate.opsForZSet().rank(RedisConstants.WAITING_QUEUE, userId);
-        return WaitingsApiResponse.success("대기열 진입 성공", Map.of("rank", rank + 1, "userId", userId));
+        String token = generateHmacToken(userId);
+        return WaitingsApiResponse.success("대기열 진입 성공", Map.of("rank", rank + 1, "userId", userId, "token", token));
     }
 
     public WaitingsApiResponse<?> checkWaitingQueue(String userId) {
@@ -114,5 +122,17 @@ public class WaitingService {
         redisTemplate.delete(RedisConstants.WAITING_QUEUE);
         log.info("[이벤트 종료] eventId={} 대기열 삭제 완료", eventId);
         return WaitingsApiResponse.success("이벤트가 종료되었습니다.");
+    }
+
+    // HMAC-SHA256 토큰 생성 (슬라이드 ⑤번 - 대기열 토큰 위조 방어)
+    private String generateHmacToken(String userId) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            SecretKeySpec keySpec = new SecretKeySpec(hmacSecretKey.getBytes(), "HmacSHA256");
+            mac.init(keySpec);
+            return Base64.getEncoder().encodeToString(mac.doFinal(userId.getBytes()));
+        } catch (Exception e) {
+            throw new RuntimeException("Token generation failed", e);
+        }
     }
 }

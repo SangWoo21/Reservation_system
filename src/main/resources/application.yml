@@ -1,8 +1,8 @@
 spring:
   datasource:
-    url: jdbc:mysql://reservation.c9iqgkqq2vql.ap-southeast-2.rds.amazonaws.com:3306/ticketing?createDatabaseIfNotExist=true&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
-    username: admin
-    password: reservation123!
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 20
@@ -11,16 +11,47 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: update        # 처음엔 update로 (테이블 자동 생성)
+      ddl-auto: update
     properties:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
         format_sql: true
-    show-sql: true            # SQL 콘솔에 출력
+    show-sql: true
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      timeout: 3000
+      lettuce:
+        pool:
+          max-active: 10
+          max-idle: 10
+          min-idle: 2
+
+  cloud:
+    aws:
+      region:
+        static: ${AWS_REGION:ap-northeast-2}
 
   lifecycle:
     timeout-per-shutdown-phase: 270s
 
+cloud:
+  aws:
+    sqs:
+      queue-url: ${SQS_QUEUE_URL}
+      lifecycle-hook-queue-url: ${SQS_LIFECYCLE_HOOK_QUEUE_URL}
+
+queue1:
+  ttl-minutes: 3
+  drain-size: 10
+
 server:
   port: 8080
   shutdown: graceful
+  forward-headers-strategy: framework
+
+hmac:
+  secret:
+    key: ${HMAC_SECRET_KEY}

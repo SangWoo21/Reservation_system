@@ -62,3 +62,4 @@ services:
       - SPRING_CLOUD_AWS_SQS_ENDPOINT=http://localstack:4566
       - CLOUD_AWS_SQS_QUEUE_URL=http://localstack:4566/000000000000/waiting-process-queue
       - CLOUD_AWS_SQS_LIFECYCLE_HOOK_QUEUE_URL=http://localstack:4566/000000000000/lifecycle-hook-queue
+      - HMAC_SECRET_KEY=local-dev-secret-key
