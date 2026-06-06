@@ -4,6 +4,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.header.writers.XXssProtectionHeaderWriter;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
@@ -11,6 +16,21 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public UserDetailsService userDetailsService(PasswordEncoder passwordEncoder) {
+        return new InMemoryUserDetailsManager(
+            User.withUsername("admin")
+                .password(passwordEncoder.encode("admin1234"))
+                .roles("ADMIN")
+                .build()
+        );
+    }
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http, HmacTokenFilter hmacTokenFilter) throws Exception {
@@ -37,7 +57,10 @@ public class SecurityConfig {
                 .requestMatchers("/actuator/health").permitAll()
                 .requestMatchers("/api/admin/**").authenticated()
                 .anyRequest().authenticated()
-            );
+            )
+
+            // Basic Auth 활성화
+            .httpBasic(basic -> {});
 
         http.addFilterBefore(hmacTokenFilter, UsernamePasswordAuthenticationFilter.class);
 
