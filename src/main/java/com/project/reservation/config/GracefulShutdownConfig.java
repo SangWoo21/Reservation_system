@@ -1,5 +1,6 @@
 package com.project.reservation.config;
 
+import com.project.reservation.service.LifecycleHookService;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -9,9 +10,12 @@ import org.springframework.stereotype.Component;
 public class GracefulShutdownConfig implements ApplicationListener<ContextClosedEvent> {
 
     private final RedisTemplate<String, String> redisTemplate;
+    private final LifecycleHookService lifecycleHookService;
 
-    public GracefulShutdownConfig(RedisTemplate<String, String> redisTemplate) {
+    public GracefulShutdownConfig(RedisTemplate<String, String> redisTemplate,
+                                  LifecycleHookService lifecycleHookService) {
         this.redisTemplate = redisTemplate;
+        this.lifecycleHookService = lifecycleHookService;
     }
 
     // Scale In 시 Session Drop 방지 (슬라이드 주제 선정 이유 - Scale In 한계)
@@ -24,6 +28,12 @@ public class GracefulShutdownConfig implements ApplicationListener<ContextClosed
             System.out.println("[SHUTDOWN] 요청 처리 완료 - 인스턴스 종료");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+
+        // ASG terminate-hook에 완료 신호 전송
+        String instanceId = lifecycleHookService.fetchInstanceId();
+        if (instanceId != null) {
+            lifecycleHookService.completeTermination(instanceId);
         }
     }
 }
