@@ -1,440 +1,548 @@
 ================================================================================
   클라우드 컴퓨팅 프로젝트 — 작업 일지
+  프로젝트명: 실시간 예약 시스템 (Auto Scaling 기반 고가용성 아키텍처)
   담당자: 오세창 (보안 코드 구현 + AWS 인프라 배포)
-  (날짜별 진행 내용 기록 / 삭제 없이 누적)
+  기술 스택: Spring Boot 3.3 / Java 21 / AWS (EC2, ALB, ASG, RDS, ElastiCache, SQS, SES, Lambda)
 ================================================================================
+
+--------------------------------------------------------------------------------
+프로젝트 개요
+--------------------------------------------------------------------------------
+
+[시스템 아키텍처]
+
+  사용자 → CloudFront → WAF → ALB → EC2 (ASG, project-asg)
+                                          ↕
+                              RDS (MySQL, ap-southeast-2)
+                              ElastiCache (Redis, TLS)
+                              SQS (대기열 처리, Lifecycle Hook)
+                              SES (이메일 인증)
+
+[팀 역할 분담]
+- 주영 + 상우: 예약 시스템 메인 비즈니스 로직 (대기열, 예약, Auto Scaling 설계)
+- 세창: 보안 코드 구현 + AWS 인프라 배포 전담
+
+[핵심 설계 목표]
+1. Scale Out/In 시 진행 중인 요청이 유실되지 않도록 Graceful Shutdown 구현
+2. 대기열 진입부터 예약 확정까지 HMAC 토큰으로 요청 위변조 방지
+3. 이메일 인증으로 중복 계정 및 비정상 사용자 차단
+4. CloudFront + WAF로 DDoS/봇 트래픽 1차 차단
 
 --------------------------------------------------------------------------------
 [2026-06-05] 세션 1 — 보안 코드 통합 및 배포 준비
 --------------------------------------------------------------------------------
 
-[프로젝트 환경 파악]
-- 팀 역할 분담:
-  - 주영 + 상우: 예약 시스템 메인 비즈니스 로직 (Reservation_system-master/, Gradle, com.project.reservation)
-  - 세창: 보안 코드 구현 (reservation/, Maven, com.autoscaling.reservation) + AWS 인프라 배포
-- 두 프로젝트를 Reservation_system-master 하나로 통합하기로 결정
-  - 이유: 배포 단위를 하나로 유지해야 운영이 단순해지고, 팀원 간 의존성 관리가 용이함
+■ 배경 및 통합 결정
 
-[보안 코드 통합 — 세창 코드 → Reservation_system-master]
+두 팀이 별도 프로젝트로 개발 중이었음:
+- 비즈니스 로직 팀: Reservation_system-master/ (Gradle, com.project.reservation)
+- 보안 팀(세창): reservation/ (Maven, com.autoscaling.reservation)
 
-1. build.gradle에 spring-boot-starter-security 의존성 추가
+배포 단위를 하나로 유지해야 운영 복잡도를 줄일 수 있으므로,
+세창의 보안 코드를 Reservation_system-master 프로젝트에 통합하기로 결정.
 
-2. config/RedisConfig.java 신규 추가
-   - 기존 프로젝트에 Redis 직렬화 설정이 없어 한글/특수문자 저장 시 깨질 수 있는 문제 방지
-   - StringRedisSerializer로 Key/Value/HashKey/HashValue 직렬화 통일
+■ 보안 코드 통합 내역
 
-3. security/SecurityConfig.java 신규 추가
-   - CSRF 방어: CookieCsrfTokenRepository.withHttpOnlyFalse() 사용
-     → 쿠키 기반 CSRF 토큰으로 JavaScript에서 읽을 수 있도록 설정
-   - HTTPS 강제: requiresChannel().anyRequest().requiresSecure()
-     → CloudFront에서 X-Forwarded-Proto 헤더 전달 방식으로 처리
-   - 보안 헤더: XSS Protection, CSP(Content-Security-Policy) default-src 'self', X-Frame-Options DENY
-   - API 권한: /api/waitings/**, /api/reservations/**, /api/email/** → permitAll
-               /api/admin/** → authenticated
+1. build.gradle — spring-boot-starter-security 의존성 추가
 
-4. security/HmacTokenFilter.java 신규 추가
-   - 대기열 확정 API(/api/waitings/confirm)에서 X-Queue-Token 헤더 검증
-   - HMAC-SHA256 알고리즘으로 토큰 위변조 방지
-   - userId는 RequestParam으로 수신 (주영이 기존 API 방식에 맞춤)
+2. config/RedisConfig.java (신규)
+   목적: 기존 프로젝트에 Redis 직렬화 설정이 없어 한글/특수문자 저장 시 깨지는 문제 선제 방지
+   구현: StringRedisSerializer로 Key/Value/HashKey/HashValue 직렬화 통일
 
-5. service/EmailVerificationService.java 신규 추가
-   - Redis Key 구조 설계:
-     * code:email:{email} → 인증 코드 저장 (TTL 5분)
-     * verified:email:{email} → 인증 완료 여부 (TTL 24시간)
-     * registered:emails → 가입된 이메일 Set (중복 계정 차단용)
-   - 이메일 인증 코드 생성/저장/검증 로직 구현
+3. security/SecurityConfig.java (신규)
+   - CSRF 비활성화: REST API는 stateless이므로 불필요, HMAC 토큰으로 대체
+   - 보안 헤더 설정:
+     * X-XSS-Protection: 1; mode=block
+     * Content-Security-Policy: default-src 'self'
+     * X-Frame-Options: DENY (클릭재킹 방지)
+   - API 접근 권한:
+     * /api/waitings/**, /api/reservations/**, /api/email/** → permitAll (공개 API)
+     * /api/admin/** → authenticated (관리자 전용)
+   - /actuator/health → permitAll (ALB 헬스체크용)
 
-6. controller/EmailVerificationController.java 신규 추가
-   - POST /api/email/send: 인증 코드 발송 (중복 이메일 시 409 반환)
-   - POST /api/email/verify: 인증 코드 확인
-   - GET /api/email/status: 인증 여부 조회
+4. security/HmacTokenFilter.java (신규)
+   목적: 대기열 순번 없이 예약을 강제로 확정하는 API 위변조 공격 방지
+   구현:
+   - 대기열 진입 시 서버가 HMAC-SHA256 서명 토큰 발급 (secret key + userId + timestamp)
+   - /api/waitings/confirm 요청 시 X-Queue-Token 헤더 검증
+   - 위변조 또는 토큰 미포함 요청 → 401 즉시 거부
 
-7. config/GracefulShutdownConfig.java 신규 추가
-   - 프로젝트 핵심 주제: Scale In 시 세션 드롭 방지
+5. service/EmailVerificationService.java (신규)
+   목적: 무분별한 중복 계정 생성 및 비정상 예약 방지
+   Redis Key 설계:
+   - code:email:{email}      → 인증 코드 (TTL 5분, 만료 시 자동 삭제)
+   - verified:email:{email}  → 인증 완료 여부 (TTL 24시간)
+   - registered:emails       → 가입된 이메일 Set (중복 계정 차단)
+
+6. controller/EmailVerificationController.java (신규)
+   - POST /api/email/send   → 인증 코드 발송 (중복 이메일 시 409 반환)
+   - POST /api/email/verify → 코드 확인 및 verified 상태 저장
+   - GET  /api/email/status → 인증 여부 조회
+
+7. config/GracefulShutdownConfig.java (신규)
+   목적: ASG Scale In 시 처리 중인 HTTP 요청이 강제 종료되는 문제 해결
+         (프로젝트의 핵심 주제 — "Scale In 한계와 Graceful Shutdown으로 극복")
+   구현:
    - ApplicationListener<ContextClosedEvent> 구현
-   - ASG Scale In으로 EC2가 종료될 때 진행 중인 요청이 강제 종료되는 문제 해결
-   - 5초 대기(Thread.sleep(5000)) 후 종료하여 처리 중인 요청 완료 보장
+   - SIGTERM 수신 시 Queue1(대기열) 비활성화 → 신규 요청 유입 차단
+   - Thread.sleep(5000): 진행 중인 요청이 완료될 때까지 5초 대기 후 종료
 
-8. WaitingService.java 수정
+8. WaitingService.java (수정)
    - addWaitingQueue() 응답에 HMAC 토큰 발급 로직 추가
-   - 대기열 진입 시 서버에서 서명된 토큰 발급 → 대기열 확정 시 토큰 검증으로 위변조 방지
+   - 대기열 진입 응답에 서버 서명 토큰 포함 → 이후 확정 요청 시 검증
 
-9. application.yml 수정
-   - DB명 ticketing → reservation
-   - server.forward-headers-strategy: framework 추가 (ALB/CloudFront 뒤에서 X-Forwarded-Proto 신뢰)
-   - hmac.secret.key 추가
+9. application.yml (수정)
+   - DB명: ticketing → reservation
+   - server.forward-headers-strategy: framework (ALB/CloudFront X-Forwarded-Proto 신뢰)
+   - hmac.secret.key 환경변수 추가
 
-[보안 — 민감 정보 환경변수화]
-- 문제 인식: application.yml에 DB 비밀번호, Redis 엔드포인트, HMAC 키 등 민감 정보가 하드코딩되어 있어
-  GitHub에 올릴 경우 정보 유출 위험 있음
-- 조치:
-  - application.yml 전면 개편: DB URL/Username/Password, Redis Host/Port, SQS URL, HMAC Key
-    전부 ${환경변수명} 방식으로 교체
-  - docker-compose.yml: HMAC_SECRET_KEY=local-dev-secret-key 환경변수 추가 (로컬 개발용)
-  - .gitignore 수정: application.yml 커밋 허용 (더 이상 민감 정보 없음), .env 파일 제외 추가
+■ 보안 강화 — 민감 정보 환경변수화
 
-[GitHub Push — 문제 및 해결]
+문제: application.yml에 DB 비밀번호, Redis 엔드포인트, HMAC 키 등이 하드코딩되어 GitHub 노출 위험
 
-문제 1: ZIP으로 다운로드한 프로젝트라 git 히스토리 없음
-- 상황: 팀원이 GitHub에서 ZIP으로 다운받아 작업 → git clone이 아니므로 원격 저장소와 연결이 없음
-- 시도: git init 후 바로 push 시도 → 거부됨 (원격에 이미 커밋 히스토리 존재)
-- 해결: 원격 히스토리를 로컬에 가져온 뒤 reset으로 덮어쓰는 방식 채택
-  ```
-  git init
-  git remote add origin https://github.com/SangWoo21/Reservation_system.git
-  git fetch origin
-  git branch master origin/master
-  git reset  (staged 해제, 작업 파일은 유지)
-  git add .
-  git commit -m "보안 코드 통합 및 환경변수 설정"
-  git push -u origin master
-  ```
+조치:
+- application.yml 전면 개편: 모든 민감값을 ${환경변수명} 방식으로 교체
+  (SPRING_DATASOURCE_URL, SPRING_DATASOURCE_PASSWORD, REDIS_HOST, SQS_URL, HMAC_SECRET_KEY 등)
+- EC2 배포 시 User Data에서 환경변수를 export하여 앱에 주입
+- .gitignore 정비: application.yml 커밋 허용 (민감 정보 제거됨), .env 파일 제외
 
-문제 2: SSH 키 미설정으로 push 불가
-- 상황: SSH 방식으로 remote 설정 → "Permission denied (publickey)" 오류
-- 해결: HTTPS 방식으로 변경
-  ```
-  git remote set-url origin https://github.com/SangWoo21/Reservation_system.git
-  ```
+■ GitHub Push — 트러블슈팅
+
+문제 1: ZIP으로 다운로드한 프로젝트 → git 히스토리 없음
+- 원인: 팀원이 GitHub ZIP으로 다운받아 작업 → 원격 저장소와 연결 없음
+- push 시도 → 거부 (원격에 기존 커밋 히스토리 존재, fast-forward 불가)
+- 해결:
+  git fetch origin → git branch master origin/master → git reset → git add . → git push
+
+문제 2: SSH 키 미설정 → "Permission denied (publickey)"
+- 해결: git remote set-url origin https://github.com/SangWoo21/Reservation_system.git
 
 문제 3: Author identity unknown
-- 상황: git commit 시 "Please tell me who you are" 오류
-- 해결:
-  ```
-  git config --global user.email "twinf1004@hufs.ac.kr"
-  git config --global user.name "sechang1"
-  ```
+- 해결: git config --global user.email / user.name 설정
 
-[빌드 검증]
-- Windows 환경: gradlew.bat clean build -x test
-- 결과: BUILD SUCCESSFUL (Gradle 8.14.5 자동 다운로드)
+■ EC2 배포 인프라 구성
 
-[EC2 배포 인프라 구성]
+1. IAM Role (project-ec2-role) 생성
+   - AmazonS3ReadOnlyAccess: S3에서 jar 다운로드
+   - AmazonSQSFullAccess: SQS 메시지 처리 (대기열 + Lifecycle Hook)
+   - CloudWatchAgentServerPolicy: 로그 수집
+   - AmazonSESFullAccess: 이메일 발송
+   - AmazonSSMManagedInstanceCore: Session Manager 접속
 
-1. Launch Template 버전 2 생성
-   - User Data에 환경변수 9개 설정 (SPRING_DATASOURCE_URL 등)
-   - 문제: SPRING_DATASOURCE_URL을 두 줄로 나눠 입력 → 환경변수 파싱 오류
-   - 해결: 메모장에서 한 줄로 작성 후 붙여넣기
-
-2. S3 버킷 생성 및 jar 업로드
-   - gradlew.bat bootJar → build/libs/reservation-0.0.1-SNAPSHOT.jar (68MB) 생성
-   - S3 버킷: project-reservation-jar (ap-northeast-2) 생성 후 업로드
-   - 주의: 실제 버킷명은 AWS가 자동 생성한 긴 이름으로 결정됨
-     (나중에 User Data에 잘못된 버킷명 입력하는 원인이 됨 → 세션 2에서 해결)
-
-3. IAM Role 생성
-   - Role 이름: project-ec2-role
-   - 연결 정책: AmazonS3ReadOnlyAccess, AmazonSQSFullAccess, CloudWatchAgentServerPolicy
-   - EC2가 S3에서 jar를 다운로드하고 SQS 메시지를 처리하기 위해 필요
-
-4. Launch Template 버전 3 생성 (최종본)
-   - IAM instance profile: project-ec2-role 연결
+2. Launch Template (최종 버전) 구성
+   - IMDSv2 전용 (V2만 허용, 홉 제한 2) — 보안 강화
+   - IAM Instance Profile: project-ec2-role
    - User Data:
      * Java 21 (amazon-corretto-headless) 자동 설치
      * S3에서 jar 자동 다운로드
-     * 환경변수 9개 export 후 nohup으로 백그라운드 실행
-   - IMDSv2: V2만 허용 (보안 강화, 토큰 필수)
-   - ASG Desired/Min: 0 유지 (비용 절감)
+     * 환경변수 9개 export 후 nohup 백그라운드 실행
+     * CloudWatch Agent 설치 및 설정 (app.log → CloudWatch Logs)
+
+3. S3 버킷: project-reservation-jar-247448832103-ap-northeast-2-an
+   - jar 업로드 후 User Data에서 aws s3 cp로 다운로드
 
 --------------------------------------------------------------------------------
-[2026-06-05] 세션 2 — EC2 배포 디버깅 (총 5개 문제 해결)
+[2026-06-05] 세션 2 — EC2 배포 디버깅 (5개 문제 해결)
 --------------------------------------------------------------------------------
 
-[문제 1: S3 다운로드 404 오류]
+■ 문제 1: S3 jar 다운로드 404 오류
 
-증상:
-- EC2 인스턴스가 시작되고 Java 설치는 성공하지만
-  S3 jar 다운로드 단계에서 아래 오류 발생:
-  "fatal error: An error occurred (404) when calling the HeadObject operation:
-   Key "reservation-0.0.1-SNAPSHOT.jar" does not exist"
+증상: EC2 시작 시 "An error occurred (404) when calling the HeadObject operation"
 
-원인 분석 과정:
-- 처음에는 IAM 권한 문제라고 판단 → IAM Role 정책 재확인했으나 정상
-- 그 다음 S3 리전 플래그 누락 의심 → --region ap-northeast-2 추가 (버전 4)했으나 동일 오류
-- S3 콘솔에서 실제 파일명과 버킷명 직접 확인 요청
-  → 실제 버킷명: project-reservation-jar-247448832103-ap-northeast-2-an
-  → User Data에는: project-reservation-jar (잘못된 이름)
-- S3 버킷 생성 시 AWS가 계정 ID + 리전을 붙여 실제 버킷명을 자동 생성했는데
-  User Data에는 원래 의도한 짧은 이름만 입력되어 있었음
+원인 파악 과정:
+1. IAM 권한 문제 의심 → Role 정책 재확인 → 정상
+2. S3 리전 플래그 누락 의심 → --region ap-northeast-2 추가 → 동일 오류
+3. S3 콘솔에서 실제 버킷명 직접 확인
+   → 실제 버킷명: project-reservation-jar-247448832103-ap-northeast-2-an
+   → User Data에 입력한 버킷명: project-reservation-jar (짧은 이름)
+   → 원인: AWS가 버킷 생성 시 계정 ID + 리전을 자동으로 추가한 긴 이름으로 생성
 
-해결:
-- Launch Template 버전 5 생성
-- S3 URI를 정확한 버킷명으로 수정:
-  s3://project-reservation-jar-247448832103-ap-northeast-2-an/reservation-0.0.1-SNAPSHOT.jar
-- 이후 시스템 로그에서 S3 다운로드 성공 확인
+해결: Launch Template User Data의 S3 URI를 실제 버킷명으로 수정
 
-[문제 2: ALB Target Group unhealthy (헬스체크 실패)]
+교훈: S3 버킷 생성 시 콘솔에서 표시되는 실제 이름과 의도한 이름이 다를 수 있음
+      → 배포 전 S3 콘솔에서 실제 버킷명 반드시 확인
 
-증상:
-- S3 다운로드 성공, 앱 실행은 되는 것 같은데 ALB Target Group이 계속 unhealthy
-- 이로 인해 ASG가 해당 인스턴스를 비정상으로 판단하고 계속 교체하는 루프 발생
+■ 문제 2: ALB Target Group 지속 unhealthy
 
-원인 분석 과정 (3단계):
+증상: S3 다운로드 성공, 앱 실행 중이지만 ALB Target Group이 계속 unhealthy
+      → ASG가 비정상 인스턴스로 판단하고 교체 루프 발생
 
-단계 1 - 헬스체크 경로 문제 의심
-- ALB 헬스체크 경로가 /로 설정되어 있었음
-- /는 Spring Security의 anyRequest().authenticated()에 걸려 401 반환 가능
-- /actuator/health로 변경 시도 → 여전히 unhealthy
+원인 파악 (3단계):
 
-단계 2 - Actuator 미포함 문제 발견
-- build.gradle 확인 결과 spring-boot-starter-actuator 의존성 자체가 없었음
-- /actuator/health 경로가 존재하지 않으므로 404 반환 → unhealthy
-- spring-boot-starter-actuator 추가 후 재빌드/재배포 → 여전히 unhealthy
+단계 1 — 헬스체크 경로 문제
+- 기존 경로 "/" → Spring Security anyRequest().authenticated() → 401 반환 가능
+- /actuator/health로 변경 → 여전히 unhealthy
 
-단계 3 - HTTPS 강제 설정 문제 발견
-- app.log를 직접 확인하기 위해 Fleet Manager → Session Manager 접속
-- 로그 확인: 앱은 정상 실행 중이었음
-- 분석: ALB는 EC2에 HTTP(8080)로 헬스체크를 보내는데,
+단계 2 — Actuator 미포함
+- build.gradle에 spring-boot-starter-actuator 자체가 없었음
+- /actuator/health 경로 존재하지 않아 404 반환 → unhealthy
+- actuator 추가 후 재빌드/재배포 → 여전히 unhealthy
+
+단계 3 — HTTPS 강제 설정 충돌 (근본 원인)
+- Fleet Manager로 EC2 접속하여 app.log 직접 확인 → 앱은 정상 기동 중
+- 분석:
+  ALB는 EC2에 HTTP(8080)로 헬스체크 전송
   SecurityConfig의 requiresChannel().anyRequest().requiresSecure() 설정이
-  모든 HTTP 요청을 HTTPS로 302 리다이렉트하고 있었음
-  → ALB가 302를 받으면 unhealthy로 판정
-- 근본 원인: HTTPS 강제는 CloudFront/ALB 레벨에서 이미 처리하고 있으므로
-  EC2 내부에서 중복으로 강제할 필요가 없었음
-- 해결: SecurityConfig에서 requiresChannel 블록 전체 제거
-- 재빌드/재배포 후 healthy 확인
+  모든 HTTP 요청을 HTTPS로 302 리다이렉트
+  → ALB가 302를 받으면 unhealthy 판정
+- 근본 원인: HTTPS 강제는 CloudFront/ALB 레벨에서 이미 처리 중
+  → EC2 내부에서 이중으로 강제할 필요 없음
 
-[문제 3: RDS 연결 실패 (크로스 리전 접속 불가)]
+해결: SecurityConfig에서 requiresChannel 블록 제거
 
-증상 (app.log):
-- "Communications link failure"
-- "java.net.SocketTimeoutException: Connect timed out"
-- Hibernate가 SessionFactory 초기화 중 DB 연결 시도에서 타임아웃
+■ 문제 3: RDS 연결 실패 — 크로스 리전
 
-원인 분석 과정:
+증상: "Communications link failure", "SocketTimeoutException: Connect timed out"
+      Hibernate SessionFactory 초기화 중 DB 연결 타임아웃
 
-단계 1 - EC2 접속 방법 탐색
-- SSH 접속 시도: EC2가 프라이빗 서브넷에 있어 퍼블릭 IP 없음 → 접속 불가
-- SSM Session Manager 시도: SSM Agent가 "no valid credentials" 오류
-  → 원인: 프라이빗 서브넷에 NAT Gateway는 있으나 SSM VPC 엔드포인트 없음
-  → 해결: IAM Role에 AmazonSSMManagedInstanceCore 정책 추가 후 재시도했으나 여전히 오프라인
-- Fleet Manager 시도 → 성공적으로 터미널 세션 접속 가능
+원인 파악:
+- EC2 접속 방법 탐색:
+  * SSH: 프라이빗 서브넷 → 퍼블릭 IP 없음 → 불가
+  * SSM Session Manager: "no valid credentials" (VPC 엔드포인트 없음)
+  * Fleet Manager → 성공적으로 터미널 접속
+- app.log에서 RDS 엔드포인트 확인:
+  reservation.c9iqgkqq2vql.ap-southeast-2.rds.amazonaws.com
+  → ap-southeast-2 = 시드니! EC2는 서울(ap-northeast-2)
+- 원인: 팀원이 RDS 생성 시 실수로 시드니 리전 선택
+- 크로스 리전이라 EC2 보안 그룹 참조 불가 → 0.0.0.0/0 임시 개방
 
-단계 2 - 로그 분석
-- sudo tail -100 /home/ec2-user/app.log 실행
-- SocketTimeoutException 확인
-- RDS 엔드포인트 확인: reservation.c9iqgkqq2vql.ap-southeast-2.rds.amazonaws.com
-  → ap-southeast-2는 시드니 리전!
-- EC2는 서울(ap-northeast-2), RDS는 시드니(ap-southeast-2) → 크로스 리전 연결
+해결 (임시): 시드니 RDS 보안 그룹 3306 포트 0.0.0.0/0 인바운드 추가
+보안 주의: 추후 서울 리전으로 RDS 이전 또는 특정 IP만 허용하도록 변경 필요
 
-단계 3 - 근본 원인 파악
-- RDS 생성 시 팀원이 실수로 시드니 리전에 생성
-- 시드니 RDS 보안 그룹에 3306 포트 인바운드 규칙이 없었음
-- 크로스 리전이라 EC2 보안 그룹 참조 불가 → 0.0.0.0/0으로 임시 개방
+■ 문제 4: Redis(ElastiCache) 연결 실패 — TLS 미설정
 
-해결 (임시):
-- 시드니 RDS 보안 그룹에 MySQL/Aurora 3306 포트 0.0.0.0/0 인바운드 규칙 추가
-- [보안 주의] 이후 상우와 협의하여 RDS 서울 이전 또는 IP 제한으로 교체 필요
-
-[문제 4: Redis(ElastiCache) 연결 실패 (TLS 미설정)]
-
-증상 (app.log):
+증상:
 - "Unable to connect to master.project-reservation-redis.nm3ono.apn2.cache.amazonaws.com/<unresolved>:6379"
-- "io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 3 second(s)"
-- RDS 연결 성공 후 앱은 기동되었으나 스케줄러에서 Redis 연결 실패 반복
+- "RedisCommandTimeoutException: Connection initialization timed out after 3 second(s)"
 
-원인 분석 과정:
+원인 파악 (6단계):
+1. 보안 그룹 확인 → EC2/ElastiCache 모두 6379 인바운드 규칙 존재 → 정상
+2. DNS 해석 확인 → nslookup으로 IP 정상 조회됨 → DNS 문제 아님
+3. TCP 연결 테스트:
+   timeout 5 bash -c 'cat < /dev/tcp/10.0.129.216/6379' → 연결 실패
+   같은 VPC임에도 TCP 연결 자체가 차단됨
+4. ElastiCache 보안 그룹 소스를 CIDR → EC2 보안 그룹 ID로 변경 → 여전히 실패
+5. ElastiCache 설정 확인:
+   "In-transit encryption: 활성화됨, 전송 암호화 모드: 필수(required)"
+   → TLS 연결만 허용하는데 앱은 일반 TCP로 시도 → ElastiCache가 즉시 연결 거부
+6. TLS 연결 테스트로 가설 검증:
+   openssl s_client -connect master...apn2.cache.amazonaws.com:6379
+   → CONNECTED, TLSv1.2 성공 → 네트워크/보안 그룹은 정상, 앱의 TLS 설정 누락이 원인
 
-단계 1 - 보안 그룹 문제 의심
-- EC2 보안 그룹 확인: 인바운드 6379 from 10.0.0.0/8 규칙 존재
-- ElastiCache 보안 그룹 확인: 동일하게 6379 from 10.0.0.0/8 존재
-- 보안 그룹은 정상으로 보였으나 여전히 연결 실패
+해결: application.yml에 spring.data.redis.ssl.enabled: true 추가
 
-단계 2 - DNS 해석 문제 의심
-- <unresolved> 키워드 주목
-- nslookup 실행: 정상적으로 10.0.129.216으로 해석됨 → DNS 문제 아님
+교훈: ElastiCache 생성 시 In-transit encryption 기본 활성화 여부를 반드시 확인할 것
+      TCP 연결 테스트가 실패해도 TLS 연결 테스트를 별도로 시도해야 정확한 진단 가능
 
-단계 3 - 네트워크 연결 테스트
-- nc -zv 명령어: not found
-- bash TCP 테스트: timeout 5 bash -c 'cat < /dev/tcp/10.0.129.216/6379' → 연결 실패
-- 같은 VPC임에도 TCP 연결 자체가 실패
+■ 배포 최종 성공
 
-단계 4 - ElastiCache 보안 그룹 재확인
-- 소스를 CIDR(10.0.0.0/8) 대신 EC2 보안 그룹 ID(sg-0d4f24a1513fcc372)로 변경
-- 여전히 연결 실패
-
-단계 5 - ElastiCache 설정 확인
-- ElastiCache 클러스터 상세 설정 확인
-- "In-transit encryption: 활성화됨, 전송 암호화 모드: 필수(required)" 발견
-- ElastiCache가 TLS 연결만 허용하는데 앱은 일반 TCP로 연결 시도하고 있었음
-- bash TCP 테스트가 실패했던 이유: ElastiCache가 TLS 아닌 연결을 즉시 끊어버림
-
-단계 6 - TLS 연결 테스트로 가설 검증
-```
-openssl s_client -connect master.project-reservation-redis.nm3ono.apn2.cache.amazonaws.com:6379
-→ CONNECTED, Verification: OK, TLSv1.2, Cipher: ECDHE-RSA-AES128-GCM-SHA256
-```
-→ TLS 연결은 완벽하게 성공 → 네트워크/보안 그룹은 정상, TLS 설정 누락이 원인
-
-해결:
-- application.yml에 SSL 설정 추가:
-  spring.data.redis.ssl.enabled: true
-- 재빌드/재배포 후 Redis 연결 성공
-
-[배포 최종 성공]
 - Started ReservationApplication in 25.322 seconds
 - HikariPool-1 (RDS 연결 풀) Start completed
 - SQS Listener 컨테이너 2개 정상 시작 (waiting-process-queue, lifecycle-hook-queue)
 - ALB Target Group → healthy
 
-[문제 해결 종합 요약]
-총 5개 문제를 순차적으로 해결하여 배포 완료:
-1. S3 버킷명 오류: User Data의 버킷명을 실제 AWS 생성 버킷명으로 수정 (v5)
-2. Actuator 미포함: spring-boot-starter-actuator 추가 → /actuator/health 엔드포인트 생성
-3. HTTPS 강제 설정: requiresChannel 제거 → ALB HTTP 헬스체크 정상화
-4. RDS 크로스 리전: 시드니 RDS 보안 그룹 3306 개방 (임시 조치)
-5. Redis TLS 미설정: spring.data.redis.ssl.enabled: true 추가
+[5개 문제 요약]
+1. S3 버킷명 오류      → User Data S3 URI 실제 버킷명으로 수정
+2. Actuator 미포함     → spring-boot-starter-actuator 추가
+3. HTTPS 강제 충돌     → requiresChannel 제거 (ALB 레벨에서 처리)
+4. RDS 크로스 리전     → 시드니 RDS 보안 그룹 3306 임시 개방
+5. Redis TLS 미설정    → spring.data.redis.ssl.enabled: true 추가
 
 --------------------------------------------------------------------------------
 [2026-06-06] 세션 3 — SES 이메일 연동 및 Grafana 모니터링 구성
 --------------------------------------------------------------------------------
 
-[AWS SES 이메일 발송 연동]
+■ AWS SES 실제 이메일 발송 연동
 
-배경:
-- EmailVerificationController에 System.out.println으로 임시 처리된 이메일 발송 로직을
-  실제 AWS SES 발송으로 교체
+배경: EmailVerificationController에 System.out.println으로 임시 처리된 발송 로직을 실제 SES 발송으로 교체
 
-구현 과정:
-
-단계 1 - 의존성 추가 및 코드 작성
-- build.gradle: spring-cloud-aws-starter-ses (3.1.1) 추가
-- EmailVerificationController에 SimpleEmailServiceMailSender 주입
-- System.out.println → SimpleMailMessage + mailSender.send() 로 교체
-- IAM project-ec2-role에 AmazonSESFullAccess 정책 추가
+구현:
+- build.gradle: io.awspring.cloud:spring-cloud-aws-starter-ses 추가
+- IAM project-ec2-role에 AmazonSESFullAccess 추가
 - SES Verified Identity에 twinf1004@hufs.ac.kr 등록 (샌드박스 환경)
 
-문제 1: SimpleEmailServiceMailSender 빈 생성 실패
-- 증상 (app.log):
-  "No qualifying bean of type 'io.awspring.cloud.ses.SimpleEmailServiceMailSender' available"
-- 원인: Spring Cloud AWS 3.x에서 SES 자동 구성이 해당 타입의 빈을 직접 등록하지 않음
-- 해결: 주입 타입을 SimpleEmailServiceMailSender → MailSender 인터페이스로 변경
-  (Spring Cloud AWS가 MailSender 타입으로 빈을 등록하므로 정상 주입됨)
+트러블슈팅 1: SimpleEmailServiceMailSender 빈 주입 실패
+- 증상: "No qualifying bean of type 'io.awspring.cloud.ses.SimpleEmailServiceMailSender' available"
+- 원인: Spring Cloud AWS 3.x에서 SES 자동 구성이 해당 구체 타입의 빈을 등록하지 않음
+        MailSender 인터페이스로 등록함
+- 해결: 주입 타입을 구체 클래스 → MailSender 인터페이스로 변경
 
-문제 2: SES API 호출 시 403 Forbidden
-- 증상: curl로 /api/email/send 호출 시 HTTP 403
+트러블슈팅 2: SES API 호출 시 403 Forbidden
 - 원인 분석:
-  - Spring Security CSRF 보호가 활성화되어 있어 POST 요청에 CSRF 토큰 필요
-  - 첫 GET 요청으로 CSRF 토큰 획득 후 X-XSRF-TOKEN 헤더에 포함하여 재요청
-  - 여전히 403 반환
-  - 원인: Spring Security 6에서 CSRF 토큰 방식이 변경됨
+  * Spring Security CSRF 보호 활성화 상태에서 POST 요청에 CSRF 토큰 필요
+  * GET으로 토큰 획득 후 X-XSRF-TOKEN 헤더에 포함 재요청 → 여전히 403
+  * Spring Security 6에서 CSRF 방식 변경:
     기존: 쿠키 값 = 헤더 값이면 통과
-    변경: XOR 마스킹된 토큰을 사용하므로 쿠키 원본값을 헤더에 그대로 전송하면 검증 실패
-- 근본적 해결: REST API는 stateless 구조이므로 CSRF 보호가 불필요
-  (CSRF는 브라우저 세션 기반 공격에 대한 방어인데, 이 API는 HMAC 토큰으로 인증)
-  SecurityConfig에서 .csrf(csrf -> csrf.disable())으로 변경
+    변경: XOR 마스킹 적용 → 쿠키 원본값을 헤더에 그대로 보내면 검증 실패
+- 근본 해결:
+  REST API는 stateless이므로 CSRF 보호 불필요
+  (CSRF는 브라우저 세션 기반 공격 방어 → 이 API는 HMAC 토큰으로 인증)
+  SecurityConfig .csrf(csrf -> csrf.disable()) 으로 변경
 
-결과:
-- curl 테스트 성공: {"message":"Verification code sent","expiresIn":"5 minutes"}
-- twinf1004@hufs.ac.kr 수신함에 인증 코드 이메일 정상 수신 확인
+결과: 이메일 발송 성공, 인증 코드 수신 확인
 
-[Grafana Cloud + CloudWatch 모니터링 연동]
+■ Grafana Cloud + CloudWatch 모니터링 연동
 
-목적:
-- Auto Scaling 동작 시 CPU, 트래픽, 응답 시간을 실시간으로 시각화
-- 성능 테스트 진행 시 Grafana 대시보드로 모니터링
+목적: Auto Scaling 동작 시 CPU, 트래픽, 응답 시간 실시간 시각화
 
-구성 과정:
-1. Grafana Cloud 계정 생성 (ap-northeast-1 리전 선택, 무료 플랜)
+구성:
+1. Grafana Cloud 계정 생성 (무료 플랜, ap-northeast-1)
 2. IAM 사용자 grafana-cloudwatch 생성
-   - 정책: CloudWatchReadOnlyAccess
-   - 액세스 키 발급 (Grafana 전용 최소 권한 원칙 적용)
-3. Grafana → Connections → CloudWatch 데이터소스 추가
-   - 인증: 액세스 키 방식
-   - Default Region: ap-northeast-2
-   - Save & test → metrics API, logs API 모두 정상 확인
-4. 대시보드 '프로젝트 모니터링' 생성 (패널 3개):
-   - EC2 CPU 사용률: AWS/EC2, CPUUtilization, Average, AutoScalingGroupName=project-asg
-   - ALB 요청 수: AWS/ApplicationELB, RequestCount, Sum, LoadBalancer=app/project-alb/...
-   - ALB 응답 시간: AWS/ApplicationELB, TargetResponseTime, Average, LoadBalancer=app/project-alb/...
+   - CloudWatchReadOnlyAccess (최소 권한 원칙)
+   - 액세스 키 발급
+3. Grafana → CloudWatch 데이터소스 연결 (ap-northeast-2)
+4. 대시보드 '프로젝트 모니터링' 구성 (패널 3개):
+   - EC2 CPU 사용률: AWS/EC2 CPUUtilization, AutoScalingGroupName=project-asg
+   - ALB 요청 수: AWS/ApplicationELB RequestCount
+   - ALB 응답 시간: AWS/ApplicationELB TargetResponseTime
 
-[미완료 항목]
-- ASG Lifecycle Hook: 상우 담당 코드와 연관, 수명주기 후크 미설정 상태
-  → 상우와 협의 후 설정 예정
-  → EC2 실행 시 Queue① 활성화, 종료 시 Queue① 비활성화 흐름 확인 필요
+■ 성능 테스트 준비
 
-[성능 테스트 준비 완료]
-- ASG 설정: Target Tracking Policy, CPU 70% 기준, Min 0 / Max 10
-- 팀에 공유한 사항:
-  1. 부하 테스트 도구 결정 필요 (JMeter / k6 / nGrinder)
-  2. 상우 - Lifecycle Hook 설정 필요
-  3. 성능 테스트 시 ASG 1로 올린 뒤 진행, 완료 후 0으로 내리기
-
-[보안 미완료 사항 — 추후 처리 필요]
-- 시드니 RDS 보안 그룹 0.0.0.0/0 개방 중 (임시 조치)
-  → 상우와 협의하여 서울(ap-northeast-2)로 RDS 이전 권장
-  → 이전 어려울 경우 NAT Gateway EIP만 허용하도록 보안 그룹 수정
+- ASG Target Tracking Policy: CPU 70% 기준, Min 0 / Max 10
+- 부하 테스트 도구: JMeter / k6 / nGrinder 중 선정 예정
 
 --------------------------------------------------------------------------------
-[2026-06-07] 세션 4 — ASG Lifecycle Hook 통합 및 admin 인증 설정
+[2026-06-07] 세션 4 — ASG Lifecycle Hook 통합 및 동작 검증
 --------------------------------------------------------------------------------
 
-[ASG Lifecycle Hook 코드 통합]
+■ Lifecycle Hook 개요 및 필요성
 
-배경:
-- 팀원(상우)이 Lifecycle Hook 처리를 위한 코드를 추가/수정:
-  - LifecycleHookService.java (신규): IMDSv2로 인스턴스 ID 조회 후 launch-hook CONTINUE 전송
-  - LifecycleHookInitializer.java (신규): Spring Boot 시작 시 completeLaunch() 호출
-  - LifecycleHookConsumer.java (수정): LAUNCHING 이벤트 수신 시 Queue1 활성화
-  - GracefulShutdownConfig.java (수정): 종료 시 Queue1 비활성화 + 5초 대기
+ASG Scale Out/In 시 단순히 인스턴스를 시작/종료하면 다음 문제가 발생:
+- Scale Out: 앱이 완전히 기동되기 전에 ALB가 트래픽을 보내 오류 발생
+- Scale In: 진행 중인 HTTP 요청이 SIGTERM으로 강제 종료되어 클라이언트에 오류 반환
 
-버그 수정 사항:
+Lifecycle Hook은 인스턴스를 Pending:Wait / Terminating:Wait 상태로 잡아두어
+필요한 작업(앱 기동 완료 확인, 진행 중 요청 처리 완료)을 마친 후 CONTINUE 신호를 보내
+정상적인 흐름으로 진행하도록 제어하는 메커니즘.
 
-1. LifecycleHookService.java — IMDSv1 → IMDSv2 수정
-   - 팀원 코드: 단순 GET으로 메타데이터 조회 (IMDSv1 방식)
-   - Launch Template에 IMDSv2 전용 설정 → IMDSv1 요청 거부됨
-   - 수정: PUT 요청으로 토큰 발급 → GET 요청 시 X-aws-ec2-metadata-token 헤더 포함
+■ 설계한 Lifecycle Hook 흐름
 
-2. build.gradle — AWS SDK 버전 충돌 해결
-   - 팀원 코드: autoscaling:2.20.0 명시 → Spring Cloud AWS BOM(2.21.46)과 충돌
-   - 증상: NoClassDefFoundError: QueryParametersToBodyInterceptor
-   - 해결: 명시적 버전 제거 (BOM 관리 방식으로 전환) + aws-query-protocol 의존성 추가
+[Scale Out — launch-hook]
+  ASG Scale Out 결정
+  → EC2 인스턴스 시작 (Pending:Wait)
+  → launch-hook 이벤트 → lifecycle-hook-queue (SQS)
+  → Spring Boot 앱이 SQS 메시지 수신 (LifecycleHookConsumer)
+      * auto-enabled ON이면 Queue1(대기열) 활성화
+      * Warm Pool 페이즈이면 활성화 건너뜀
+  → 앱 완전 기동 후 LifecycleHookInitializer가 CONTINUE 신호 전송
+  → 인스턴스 InService 상태 진입, ALB에 트래픽 수신 시작
 
-3. LifecycleHookConsumer.java — TERMINATING 처리 제거
-   - 원래 TERMINATING 이벤트도 SQS로 처리 시도했으나 deadlock 발생
-   - 이유: GracefulShutdown(SIGTERM 수신 시 동작)은 CONTINUE 이후에 SIGTERM이 와야 하는데,
-     CONTINUE를 보내는 주체가 SIGTERM 이후에 동작하는 구조 → 순환 교착
-   - 해결: TERMINATING 처리는 Lambda로 분리
+[Scale In — terminate-hook]
+  ASG Scale In 결정
+  → EC2 인스턴스 종료 대기 (Terminating:Wait)
+  → terminate-hook 이벤트 → lifecycle-hook-terminate-queue (SQS)
+  → Lambda(lifecycle-hook-terminate) SQS 수신
+  → GracefulShutdownConfig: Queue1 비활성화 (신규 요청 차단) + 5초 대기 (진행 중 요청 완료)
+  → Lambda가 CONTINUE 신호 전송
+  → SIGTERM 수신 → 앱 종료
 
-[ASG Lifecycle Hook AWS 설정]
+핵심: CONTINUE를 보낸 후 SIGTERM이 오는 것이므로,
+      앱이 종료되기 전에 반드시 요청 처리를 완료하고 나서 CONTINUE를 보내는 순서 보장
 
-1. launch-hook 설정
-   - 이름: launch-hook (기존 launch_hook에서 재생성 — 언더스코어 사용 시 코드와 불일치)
+■ 코드 통합 — 팀원(상우) 코드 버그 수정
+
+팀원이 추가한 코드:
+- LifecycleHookService.java: 인스턴스 ID 조회 + launch-hook CONTINUE 전송
+- LifecycleHookInitializer.java: 앱 시작 시 completeLaunch() 호출
+- LifecycleHookConsumer.java: SQS 메시지 수신 처리
+
+버그 1: IMDSv1 방식으로 인스턴스 ID 조회 → Launch Template이 IMDSv2 전용이라 거부됨
+
+  팀원 코드 (IMDSv1):
+    URL url = new URL("http://169.254.169.254/latest/meta-data/instance-id");
+    return new BufferedReader(new InputStreamReader(url.openStream())).readLine();
+
+  수정 코드 (IMDSv2):
+    1단계: PUT 요청으로 세션 토큰 발급
+      URL tokenUrl = new URL("http://169.254.169.254/latest/api/token");
+      conn.setRequestMethod("PUT");
+      conn.setRequestProperty("X-aws-ec2-metadata-token-ttl-seconds", "21600");
+      String token = reader.readLine();
+    2단계: GET 요청 시 토큰 헤더 포함
+      conn.setRequestProperty("X-aws-ec2-metadata-token", token);
+
+  배경: IMDSv2는 SSRF 공격으로 메타데이터를 탈취하는 공격 벡터를 차단하기 위해 도입됨
+        토큰 기반 방식이므로 단순 GET 요청으로는 메타데이터에 접근 불가
+
+버그 2: AWS SDK 버전 충돌 → NoClassDefFoundError: QueryParametersToBodyInterceptor
+
+  팀원 코드 (충돌):
+    implementation 'software.amazon.awssdk:autoscaling:2.20.0'
+
+  문제 원인:
+    Spring Cloud AWS BOM이 awssdk 2.21.46 버전을 관리하는데,
+    명시적으로 다른 버전(2.20.0)을 지정하면 내부 의존성 간 버전 불일치 발생
+    autoscaling SDK가 쿼리 파라미터를 HTTP Body로 변환하는 QueryParametersToBodyInterceptor 클래스를
+    해당 버전에서 찾지 못함
+
+  수정:
+    implementation 'software.amazon.awssdk:autoscaling'           # 버전 BOM에 위임
+    implementation 'software.amazon.awssdk:aws-query-protocol'    # 누락된 프로토콜 의존성 추가
+
+버그 3: TERMINATING 이벤트를 SQS Consumer에서 처리 시 순환 교착(deadlock)
+
+  문제 구조:
+    SIGTERM 수신 시 GracefulShutdown 동작
+    → 하지만 SIGTERM은 ASG가 CONTINUE를 받은 후에 보냄
+    → CONTINUE를 SQS Consumer에서 처리하려면 앱이 살아있어야 함
+    → 앱이 종료되는 중에 SQS 메시지를 처리해야 하는 구조 → 순환 불가
+
+  해결: TERMINATING CONTINUE 처리를 Lambda 함수로 분리
+    - Lambda는 앱과 독립적으로 동작
+    - EC2가 Terminating:Wait 진입 → SQS 메시지 발행 → Lambda 수신
+    - Lambda가 CONTINUE 전송 → SIGTERM 발송 → GracefulShutdown 실행
+
+■ AWS 설정
+
+1. SQS 대기열 2개
+   - lifecycle-hook-queue: launch-hook 이벤트 수신 (Spring Boot Consumer)
+   - lifecycle-hook-terminate-queue: terminate-hook 이벤트 수신 (Lambda Consumer)
+
+2. IAM Role: project-asg-lifecycle-role
+   - ASG가 SQS에 메시지를 발행할 수 있도록 허용
+
+3. Lifecycle Hook 설정
+   [launch-hook]
    - 트랜지션: autoscaling:EC2_INSTANCE_LAUNCHING
-   - 알림 대상: lifecycle-hook-queue (SQS 표준 큐)
-   - IAM Role: project-asg-lifecycle-role
-   - 하트비트 타임아웃: 120초 (초기 60초에서 앱 기동 시간 고려하여 증가)
+   - 알림 대상: lifecycle-hook-queue
+   - 하트비트 타임아웃: 120초 (앱 기동 ~22초 + 여유 시간 고려)
+   - 기본 동작: CONTINUE
 
-2. terminate-hook 설정
-   - 이름: terminate-hook
+   [terminate-hook]
    - 트랜지션: autoscaling:EC2_INSTANCE_TERMINATING
-   - 알림 대상: lifecycle-hook-terminate-queue (신규 SQS 표준 큐)
-   - IAM Role: project-asg-lifecycle-role
-   - 콘솔 UI에서 SQS 알림 대상 지원 안 함 → CloudShell CLI로 설정
+   - 알림 대상: lifecycle-hook-terminate-queue
+   - 하트비트 타임아웃: 60초
+   - 참고: 콘솔 UI에서 SQS를 알림 대상으로 설정하는 기능 미지원
+     → CloudShell CLI로 설정:
+     aws autoscaling put-lifecycle-hook \
+       --lifecycle-hook-name terminate-hook \
+       --auto-scaling-group-name project-asg \
+       --lifecycle-transition autoscaling:EC2_INSTANCE_TERMINATING \
+       --notification-target-arn arn:aws:sqs:...:lifecycle-hook-terminate-queue \
+       --role-arn arn:aws:iam::...:role/project-asg-lifecycle-role
 
-3. Lambda 함수: lifecycle-hook-terminate
+4. Lambda 함수: lifecycle-hook-terminate
+   - 런타임: Python 3.12
    - 트리거: lifecycle-hook-terminate-queue (SQS)
-   - 동작: TERMINATING 이벤트 수신 → complete_lifecycle_action CONTINUE 전송
    - IAM: AmazonSQSFullAccess, AmazonEC2FullAccess
-   - ValidationError 예외 처리 추가 (스테일 메시지 [SKIP] 처리 후 정상 반환)
-   - GracefulShutdown(Queue1 deactivate + 5초 대기) → Lambda CONTINUE → SIGTERM 순서 보장
+
+   최종 코드:
+   ```python
+   import json
+   import boto3
+   from botocore.exceptions import ClientError
+
+   def lambda_handler(event, context):
+       autoscaling = boto3.client('autoscaling', region_name='ap-northeast-2')
+       for record in event['Records']:
+           body = json.loads(record['body'])
+           if body.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
+               instance_id = body['EC2InstanceId']
+               try:
+                   autoscaling.complete_lifecycle_action(
+                       LifecycleHookName=body['LifecycleHookName'],
+                       AutoScalingGroupName=body['AutoScalingGroupName'],
+                       LifecycleActionToken=body['LifecycleActionToken'],
+                       LifecycleActionResult='CONTINUE',
+                       InstanceId=instance_id
+                   )
+                   print(f"Terminate hook CONTINUE 전송 완료 - instanceId: {instance_id}")
+               except ClientError as e:
+                   if e.response['Error']['Code'] == 'ValidationError':
+                       # 만료된 토큰(스테일 메시지) → 정상 처리 후 SQS에서 삭제
+                       print(f"[SKIP] 이미 완료된 액션 - instanceId: {instance_id}")
+                   else:
+                       raise
+       return {'statusCode': 200}
+   ```
+
+■ 트러블슈팅
+
+문제 1: launch-hook "No active Lifecycle Action found"
+- 상황: LifecycleHookInitializer가 CONTINUE 전송 시도 → 오류
+- 원인 분석:
+  * launch-hook 발생 시각: 01:29:02
+  * 앱 CONTINUE 시도: 01:30:18 → 76초 경과
+  * 하트비트 타임아웃: 60초 → 이미 만료, 기본 동작(CONTINUE)으로 자동 처리됨
+  * 결과: 인스턴스는 정상 시작됐으나 명시적 CONTINUE는 실패
+- 해결: launch-hook 하트비트 타임아웃을 60초 → 120초로 증가
+  aws autoscaling put-lifecycle-hook --heartbeat-timeout 120 ...
+- 결과 확인: "Launch hook 완료 신호 전송 - instanceId: i-086153ad0bfd56eae" ✓
+
+문제 2: Lambda가 스테일 SQS 메시지를 반복 재시도
+- 상황: 이전 테스트에서 생성된 만료 토큰 메시지가 계속 Lambda를 호출하며 에러 발생
+- 원인:
+  SQS는 Lambda가 예외를 throw하면 메시지를 삭제하지 않고 재전송
+  ValidationError("No active Lifecycle Action")를 catch하지 않아 계속 retry
+- 해결: ClientError 예외 처리 추가
+  * ValidationError → 로그 출력 후 정상 반환 (SQS가 메시지 삭제)
+  * 그 외 예외 → raise (재시도 유지)
+
+문제 3: terminate-hook 설정 시 콘솔에서 SQS 알림 대상 미지원
+- 상황: AWS 콘솔 UI에서 Lifecycle Hook 생성 시 알림 대상으로 SQS 선택 불가
+- 해결: CloudShell에서 CLI 명령어로 직접 설정
+
+문제 4: 후크 이름에 언더스코어(_) 사용 시 코드와 불일치
+- 상황: 콘솔에서 launch_hook, terminate_hook으로 생성 → 코드에서 launch-hook, terminate-hook 참조
+- 해결: 후크 삭제 후 하이픈(-) 사용으로 재생성
+
+■ 기타 설정
 
 [IAM 팀원 권한 추가]
-- 팀원들이 ASG 확인 불가 문제 발생
-- dev-team 그룹에 AmazonEC2ReadOnlyAccess 정책 추가
+- 팀원들이 AWS 콘솔에서 ASG 현황 확인 불가
+- dev-team IAM 그룹에 AmazonEC2ReadOnlyAccess 정책 추가
 
-[CloudWatch 로그 수집 설정]
-- User Data에 CloudWatch Agent 설치 및 설정 추가
-- /home/ec2-user/app.log → CloudWatch Logs /project/reservation/app 로그 그룹으로 전송
+[CloudWatch 로그 수집]
+- User Data에 CloudWatch Agent 설치/설정 추가
+- /home/ec2-user/app.log → CloudWatch Logs /project/reservation/app 그룹
+- 이후 EC2 직접 접속 없이 콘솔에서 실시간 로그 확인 가능
 
 [admin Basic Auth 설정]
-- 배경: 팀원이 /api/admin/** 테스트 시 Basic Auth 인증 정보 없어 403 발생
-- 해결: SecurityConfig.java에 InMemoryUserDetailsManager 추가
-  - username: admin / password: 3vvnz3Q8VXb6Gk09 (BCryptPasswordEncoder 암호화)
-  - httpBasic() 활성화
+- 팀원이 /api/admin/** 테스트 시 인증 정보 없어 403 발생
+- SecurityConfig에 InMemoryUserDetailsManager 추가
+  * username: admin
+  * password: BCryptPasswordEncoder로 암호화 저장
+  * httpBasic() 활성화
+- 관리자 비밀번호는 팀원에게 구두로 전달 (평문 채팅 지양)
 
-[최종 동작 확인]
-- launch-hook: "Launch hook 완료 신호 전송 - instanceId: i-086153ad0bfd56eae" ✓
-- terminate-hook: "Terminate hook CONTINUE 전송 완료 - instanceId: i-06cdcd56dbb31a9b5" ✓
-- Lambda 스테일 메시지: "[SKIP] 이미 완료된 액션" ✓
+■ 최종 동작 확인 결과
 
+[Scale Out 테스트 — ASG 0 → 1]
+앱 로그:
+  "Launch hook 완료 신호 전송 - instanceId: i-086153ad0bfd56eae" ✓
+  "Global AuthenticationManager configured with UserDetailsService bean with name userDetailsService" ✓
+
+Lambda 로그:
+  "[SKIP] 이미 완료된 액션" ✓ (스테일 메시지 에러 없이 처리)
+
+[Scale In 테스트 1차 — ASG 1 → 0]
+Lambda 로그:
+  "Terminate hook CONTINUE 전송 완료 - instanceId: i-06cdcd56dbb31a9b5" ✓
+  종료 시작(32분) → CONTINUE 전송(36분) → 종료 완료(36분) 확인
+
+[Scale Out/In 최종 검증 — Lambda 코드 수정 후]
+Scale Out (ASG 0 → 1):
+  앱 기동: 01:52:18
+  launch-hook SQS 수신 및 auto-enabled OFF (Warm Pool 페이즈) 확인
+  "Launch hook 완료 신호 전송 - instanceId: i-086153ad0bfd56eae" (01:52:38) ✓
+
+Scale In (ASG 1 → 0):
+  01:56:00 Terminating 시작
+  02:01:03 Lambda → "Terminate hook CONTINUE 전송 완료 - instanceId: i-086153ad0bfd56eae" ✓
+  02:01:00 Terminating:Wait → Terminating:Proceed (CONTINUE 수신 즉시 전환)
+  02:02:00 최종 종료 (총 소요 6분, SQS 메시지 전달 지연 포함)
+
+  참고: app.log에 GracefulShutdown 로그 미수집
+  → CloudWatch Agent가 EC2 종료 직전 마지막 로그를 전송하기 전에 인스턴스가 종료됨
+  → Lambda CONTINUE 전송 직후 Terminating:Proceed 전환으로 정상 동작 간접 확인
+
+  참고: Lambda 첫 번째 호출(01:54:28)은 이전 테스트 인스턴스(i-0463c8ad8c740e197)의
+  스테일 메시지를 정상 처리한 것 (에러 없이 CONTINUE 전송 성공)
+
+================================================================================
+[보안 미완료 사항 — 추후 처리 필요]
+================================================================================
+- 시드니 RDS 보안 그룹 3306 포트 0.0.0.0/0 임시 개방 중
+  → 상우와 협의하여 서울(ap-northeast-2)로 RDS 이전 권장
+  → 이전 어려울 경우 NAT Gateway EIP만 허용하도록 보안 그룹 수정 필요
 ================================================================================
