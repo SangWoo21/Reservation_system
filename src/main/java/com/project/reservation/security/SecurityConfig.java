@@ -26,7 +26,7 @@ public class SecurityConfig {
     public UserDetailsService userDetailsService(PasswordEncoder passwordEncoder) {
         return new InMemoryUserDetailsManager(
             User.withUsername("admin")
-                .password(passwordEncoder.encode("admin1234"))
+                .password(passwordEncoder.encode("3vvnz3Q8VXb6Gk09"))
                 .roles("ADMIN")
                 .build()
         );
