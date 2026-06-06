@@ -364,4 +364,77 @@ openssl s_client -connect master.project-reservation-redis.nm3ono.apn2.cache.ama
   → 상우와 협의하여 서울(ap-northeast-2)로 RDS 이전 권장
   → 이전 어려울 경우 NAT Gateway EIP만 허용하도록 보안 그룹 수정
 
+--------------------------------------------------------------------------------
+[2026-06-07] 세션 4 — ASG Lifecycle Hook 통합 및 admin 인증 설정
+--------------------------------------------------------------------------------
+
+[ASG Lifecycle Hook 코드 통합]
+
+배경:
+- 팀원(상우)이 Lifecycle Hook 처리를 위한 코드를 추가/수정:
+  - LifecycleHookService.java (신규): IMDSv2로 인스턴스 ID 조회 후 launch-hook CONTINUE 전송
+  - LifecycleHookInitializer.java (신규): Spring Boot 시작 시 completeLaunch() 호출
+  - LifecycleHookConsumer.java (수정): LAUNCHING 이벤트 수신 시 Queue1 활성화
+  - GracefulShutdownConfig.java (수정): 종료 시 Queue1 비활성화 + 5초 대기
+
+버그 수정 사항:
+
+1. LifecycleHookService.java — IMDSv1 → IMDSv2 수정
+   - 팀원 코드: 단순 GET으로 메타데이터 조회 (IMDSv1 방식)
+   - Launch Template에 IMDSv2 전용 설정 → IMDSv1 요청 거부됨
+   - 수정: PUT 요청으로 토큰 발급 → GET 요청 시 X-aws-ec2-metadata-token 헤더 포함
+
+2. build.gradle — AWS SDK 버전 충돌 해결
+   - 팀원 코드: autoscaling:2.20.0 명시 → Spring Cloud AWS BOM(2.21.46)과 충돌
+   - 증상: NoClassDefFoundError: QueryParametersToBodyInterceptor
+   - 해결: 명시적 버전 제거 (BOM 관리 방식으로 전환) + aws-query-protocol 의존성 추가
+
+3. LifecycleHookConsumer.java — TERMINATING 처리 제거
+   - 원래 TERMINATING 이벤트도 SQS로 처리 시도했으나 deadlock 발생
+   - 이유: GracefulShutdown(SIGTERM 수신 시 동작)은 CONTINUE 이후에 SIGTERM이 와야 하는데,
+     CONTINUE를 보내는 주체가 SIGTERM 이후에 동작하는 구조 → 순환 교착
+   - 해결: TERMINATING 처리는 Lambda로 분리
+
+[ASG Lifecycle Hook AWS 설정]
+
+1. launch-hook 설정
+   - 이름: launch-hook (기존 launch_hook에서 재생성 — 언더스코어 사용 시 코드와 불일치)
+   - 트랜지션: autoscaling:EC2_INSTANCE_LAUNCHING
+   - 알림 대상: lifecycle-hook-queue (SQS 표준 큐)
+   - IAM Role: project-asg-lifecycle-role
+   - 하트비트 타임아웃: 120초 (초기 60초에서 앱 기동 시간 고려하여 증가)
+
+2. terminate-hook 설정
+   - 이름: terminate-hook
+   - 트랜지션: autoscaling:EC2_INSTANCE_TERMINATING
+   - 알림 대상: lifecycle-hook-terminate-queue (신규 SQS 표준 큐)
+   - IAM Role: project-asg-lifecycle-role
+   - 콘솔 UI에서 SQS 알림 대상 지원 안 함 → CloudShell CLI로 설정
+
+3. Lambda 함수: lifecycle-hook-terminate
+   - 트리거: lifecycle-hook-terminate-queue (SQS)
+   - 동작: TERMINATING 이벤트 수신 → complete_lifecycle_action CONTINUE 전송
+   - IAM: AmazonSQSFullAccess, AmazonEC2FullAccess
+   - ValidationError 예외 처리 추가 (스테일 메시지 [SKIP] 처리 후 정상 반환)
+   - GracefulShutdown(Queue1 deactivate + 5초 대기) → Lambda CONTINUE → SIGTERM 순서 보장
+
+[IAM 팀원 권한 추가]
+- 팀원들이 ASG 확인 불가 문제 발생
+- dev-team 그룹에 AmazonEC2ReadOnlyAccess 정책 추가
+
+[CloudWatch 로그 수집 설정]
+- User Data에 CloudWatch Agent 설치 및 설정 추가
+- /home/ec2-user/app.log → CloudWatch Logs /project/reservation/app 로그 그룹으로 전송
+
+[admin Basic Auth 설정]
+- 배경: 팀원이 /api/admin/** 테스트 시 Basic Auth 인증 정보 없어 403 발생
+- 해결: SecurityConfig.java에 InMemoryUserDetailsManager 추가
+  - username: admin / password: 3vvnz3Q8VXb6Gk09 (BCryptPasswordEncoder 암호화)
+  - httpBasic() 활성화
+
+[최종 동작 확인]
+- launch-hook: "Launch hook 완료 신호 전송 - instanceId: i-086153ad0bfd56eae" ✓
+- terminate-hook: "Terminate hook CONTINUE 전송 완료 - instanceId: i-06cdcd56dbb31a9b5" ✓
+- Lambda 스테일 메시지: "[SKIP] 이미 완료된 액션" ✓
+
 ================================================================================
