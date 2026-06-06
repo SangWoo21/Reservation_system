@@ -1,178 +1,367 @@
 ================================================================================
   클라우드 컴퓨팅 프로젝트 — 작업 일지
+  담당자: 오세창 (보안 코드 구현 + AWS 인프라 배포)
   (날짜별 진행 내용 기록 / 삭제 없이 누적)
 ================================================================================
 
 --------------------------------------------------------------------------------
-[2026-06-05] 세션 1 — 코드 통합 및 배포 준비
+[2026-06-05] 세션 1 — 보안 코드 통합 및 배포 준비
 --------------------------------------------------------------------------------
 
-[환경 파악]
-- 프로젝트 폴더 구조 확인
-  - reservation/ : 세창이 임시 작업하던 보안 코드 폴더 (Maven, com.autoscaling.reservation)
-  - Reservation_system-master/ : 주영+상우 메인 프로젝트 (Gradle, com.project.reservation)
-  - application(배포용).yml, application-local(로컬테스트용).yml : 설정 파일 참고용
-  - 필독 컨텍스트.txt : 프로젝트 전체 맥락 및 해야 할 작업 목록
-- 메인 프로젝트는 Reservation_system-master로 통일하기로 결정
+[프로젝트 환경 파악]
+- 팀 역할 분담:
+  - 주영 + 상우: 예약 시스템 메인 비즈니스 로직 (Reservation_system-master/, Gradle, com.project.reservation)
+  - 세창: 보안 코드 구현 (reservation/, Maven, com.autoscaling.reservation) + AWS 인프라 배포
+- 두 프로젝트를 Reservation_system-master 하나로 통합하기로 결정
+  - 이유: 배포 단위를 하나로 유지해야 운영이 단순해지고, 팀원 간 의존성 관리가 용이함
 
-[코드 통합 — 세창 보안 코드 → Reservation_system-master]
-- build.gradle에 spring-boot-starter-security 의존성 추가
-- config/RedisConfig.java 신규 추가
-  - StringRedisSerializer로 Key/Value/HashKey/HashValue 직렬화 통일
-- security/SecurityConfig.java 신규 추가
-  - CSRF 방어 (CookieCsrfTokenRepository.withHttpOnlyFalse)
-  - HTTPS 강제 (requiresChannel)
-  - 보안 헤더 (XSS Protection, CSP default-src 'self', frameOptions deny)
-  - API 권한 설정 (/api/waitings/**, /api/reservations/**, /api/email/** permitAll, /api/admin/** authenticated)
-- security/HmacTokenFilter.java 신규 추가
-  - /api/waitings/confirm 경로에서 X-Queue-Token 헤더 HMAC-SHA256 검증
-  - userId는 RequestParam으로 수신 (주영이 API 방식에 맞춤)
-- service/EmailVerificationService.java 신규 추가
-  - Redis Key 구조: code:email:{email} (TTL 5분), verified:email:{email} (TTL 24시간), registered:emails (Set)
-  - 이메일 인증 코드 저장/검증, 중복 계정 차단
-- controller/EmailVerificationController.java 신규 추가
-  - POST /api/email/send (중복 이메일 409), POST /api/email/verify, GET /api/email/status
-- config/GracefulShutdownConfig.java 신규 추가
-  - ApplicationListener<ContextClosedEvent> 구현, Scale In 시 5초 대기 후 종료
-- waiting_redis/service/WaitingService.java 수정
-  - addWaitingQueue() 응답에 HMAC 토큰 발급 로직 추가 (generateHmacToken)
-  - 대기열 진입 응답에 token 필드 포함
-- application.yml 수정
-  - DB명 ticketing → reservation
-  - server.forward-headers-strategy: framework 추가
-  - hmac.secret.key 추가
+[보안 코드 통합 — 세창 코드 → Reservation_system-master]
 
-[보안 — 민감 정보 처리]
-- application.yml 전면 개편
-  - DB URL/Username/Password, Redis Host/Port, SQS URL, HMAC Key 전부 환경변수로 교체
-  - Redis 설정, SQS 설정, queue1 설정을 application.yml에 통합 (기존엔 배포용에만 있었음)
-- docker-compose.yml 수정
-  - HMAC_SECRET_KEY=local-dev-secret-key 환경변수 추가
-- application(배포용).yml 수정
-  - 기본값에 있던 실제 비밀번호/RDS URL 전부 환경변수 방식으로 교체
-- .gitignore 수정
-  - application.yml 커밋 허용 (더 이상 민감 정보 없으므로)
-  - .env, *.env 추가
+1. build.gradle에 spring-boot-starter-security 의존성 추가
 
-[GitHub Push]
-- git init (Reservation_system-master 폴더)
-- HTTPS 방식으로 진행 (SSH 키 미설정)
-  - remote: https://github.com/SangWoo21/Reservation_system.git
-- git fetch origin → git branch master origin/master → git reset
-  → git add . → git commit → git push -u origin master
-- 커밋 메시지: "보안 코드 통합 및 환경변수 설정"
-- 변경된 파일: build.gradle, application.yml, docker-compose.yml,
-  WaitingService.java, .gitignore
-- 신규 추가: GracefulShutdownConfig.java, RedisConfig.java,
-  EmailVerificationController.java, HmacTokenFilter.java,
-  SecurityConfig.java, EmailVerificationService.java
+2. config/RedisConfig.java 신규 추가
+   - 기존 프로젝트에 Redis 직렬화 설정이 없어 한글/특수문자 저장 시 깨질 수 있는 문제 방지
+   - StringRedisSerializer로 Key/Value/HashKey/HashValue 직렬화 통일
+
+3. security/SecurityConfig.java 신규 추가
+   - CSRF 방어: CookieCsrfTokenRepository.withHttpOnlyFalse() 사용
+     → 쿠키 기반 CSRF 토큰으로 JavaScript에서 읽을 수 있도록 설정
+   - HTTPS 강제: requiresChannel().anyRequest().requiresSecure()
+     → CloudFront에서 X-Forwarded-Proto 헤더 전달 방식으로 처리
+   - 보안 헤더: XSS Protection, CSP(Content-Security-Policy) default-src 'self', X-Frame-Options DENY
+   - API 권한: /api/waitings/**, /api/reservations/**, /api/email/** → permitAll
+               /api/admin/** → authenticated
+
+4. security/HmacTokenFilter.java 신규 추가
+   - 대기열 확정 API(/api/waitings/confirm)에서 X-Queue-Token 헤더 검증
+   - HMAC-SHA256 알고리즘으로 토큰 위변조 방지
+   - userId는 RequestParam으로 수신 (주영이 기존 API 방식에 맞춤)
+
+5. service/EmailVerificationService.java 신규 추가
+   - Redis Key 구조 설계:
+     * code:email:{email} → 인증 코드 저장 (TTL 5분)
+     * verified:email:{email} → 인증 완료 여부 (TTL 24시간)
+     * registered:emails → 가입된 이메일 Set (중복 계정 차단용)
+   - 이메일 인증 코드 생성/저장/검증 로직 구현
+
+6. controller/EmailVerificationController.java 신규 추가
+   - POST /api/email/send: 인증 코드 발송 (중복 이메일 시 409 반환)
+   - POST /api/email/verify: 인증 코드 확인
+   - GET /api/email/status: 인증 여부 조회
+
+7. config/GracefulShutdownConfig.java 신규 추가
+   - 프로젝트 핵심 주제: Scale In 시 세션 드롭 방지
+   - ApplicationListener<ContextClosedEvent> 구현
+   - ASG Scale In으로 EC2가 종료될 때 진행 중인 요청이 강제 종료되는 문제 해결
+   - 5초 대기(Thread.sleep(5000)) 후 종료하여 처리 중인 요청 완료 보장
+
+8. WaitingService.java 수정
+   - addWaitingQueue() 응답에 HMAC 토큰 발급 로직 추가
+   - 대기열 진입 시 서버에서 서명된 토큰 발급 → 대기열 확정 시 토큰 검증으로 위변조 방지
+
+9. application.yml 수정
+   - DB명 ticketing → reservation
+   - server.forward-headers-strategy: framework 추가 (ALB/CloudFront 뒤에서 X-Forwarded-Proto 신뢰)
+   - hmac.secret.key 추가
+
+[보안 — 민감 정보 환경변수화]
+- 문제 인식: application.yml에 DB 비밀번호, Redis 엔드포인트, HMAC 키 등 민감 정보가 하드코딩되어 있어
+  GitHub에 올릴 경우 정보 유출 위험 있음
+- 조치:
+  - application.yml 전면 개편: DB URL/Username/Password, Redis Host/Port, SQS URL, HMAC Key
+    전부 ${환경변수명} 방식으로 교체
+  - docker-compose.yml: HMAC_SECRET_KEY=local-dev-secret-key 환경변수 추가 (로컬 개발용)
+  - .gitignore 수정: application.yml 커밋 허용 (더 이상 민감 정보 없음), .env 파일 제외 추가
+
+[GitHub Push — 문제 및 해결]
+
+문제 1: ZIP으로 다운로드한 프로젝트라 git 히스토리 없음
+- 상황: 팀원이 GitHub에서 ZIP으로 다운받아 작업 → git clone이 아니므로 원격 저장소와 연결이 없음
+- 시도: git init 후 바로 push 시도 → 거부됨 (원격에 이미 커밋 히스토리 존재)
+- 해결: 원격 히스토리를 로컬에 가져온 뒤 reset으로 덮어쓰는 방식 채택
+  ```
+  git init
+  git remote add origin https://github.com/SangWoo21/Reservation_system.git
+  git fetch origin
+  git branch master origin/master
+  git reset  (staged 해제, 작업 파일은 유지)
+  git add .
+  git commit -m "보안 코드 통합 및 환경변수 설정"
+  git push -u origin master
+  ```
+
+문제 2: SSH 키 미설정으로 push 불가
+- 상황: SSH 방식으로 remote 설정 → "Permission denied (publickey)" 오류
+- 해결: HTTPS 방식으로 변경
+  ```
+  git remote set-url origin https://github.com/SangWoo21/Reservation_system.git
+  ```
+
+문제 3: Author identity unknown
+- 상황: git commit 시 "Please tell me who you are" 오류
+- 해결:
+  ```
+  git config --global user.email "twinf1004@hufs.ac.kr"
+  git config --global user.name "sechang1"
+  ```
 
 [빌드 검증]
-- Windows: gradlew.bat clean build -x test
+- Windows 환경: gradlew.bat clean build -x test
 - 결과: BUILD SUCCESSFUL (Gradle 8.14.5 자동 다운로드)
 
-[EC2 환경변수 설정]
-- Launch Template 버전 2 생성
-  - User Data에 환경변수 8개 설정
-    - SPRING_DATASOURCE_URL, SPRING_DATASOURCE_USERNAME, SPRING_DATASOURCE_PASSWORD
-    - SPRING_DATA_REDIS_HOST, SPRING_DATA_REDIS_PORT
-    - SQS_QUEUE_URL, SQS_LIFECYCLE_HOOK_QUEUE_URL
-    - AWS_REGION, HMAC_SECRET_KEY
-  - 버전 2를 Default로 설정
-- ASG Desired/Min → 0으로 설정 (비용 절감)
-  - 실행 중이던 EC2 인스턴스 2개 종료
+[EC2 배포 인프라 구성]
 
-[jar 빌드 및 S3 업로드]
-- gradlew.bat bootJar 실행
-- 생성 파일: build/libs/reservation-0.0.1-SNAPSHOT.jar (68MB)
-- S3 버킷 생성: project-reservation-jar (ap-northeast-2)
-- jar 파일 S3 업로드 완료
+1. Launch Template 버전 2 생성
+   - User Data에 환경변수 9개 설정 (SPRING_DATASOURCE_URL 등)
+   - 문제: SPRING_DATASOURCE_URL을 두 줄로 나눠 입력 → 환경변수 파싱 오류
+   - 해결: 메모장에서 한 줄로 작성 후 붙여넣기
 
-[IAM Role 생성]
-- Role 이름: project-ec2-role
-- 연결 정책: AmazonS3ReadOnlyAccess, AmazonSQSFullAccess, CloudWatchAgentServerPolicy
+2. S3 버킷 생성 및 jar 업로드
+   - gradlew.bat bootJar → build/libs/reservation-0.0.1-SNAPSHOT.jar (68MB) 생성
+   - S3 버킷: project-reservation-jar (ap-northeast-2) 생성 후 업로드
+   - 주의: 실제 버킷명은 AWS가 자동 생성한 긴 이름으로 결정됨
+     (나중에 User Data에 잘못된 버킷명 입력하는 원인이 됨 → 세션 2에서 해결)
 
-[Launch Template 버전 3 생성 — 최종본]
-- IAM instance profile: project-ec2-role 연결
-- User Data 완성본 작성:
-  - Java 21 (amazon-corretto-headless) 자동 설치
-  - S3에서 jar 자동 다운로드
-  - 환경변수 9개 설정 후 nohup으로 jar 실행
-- IMDSv2: V2만 해당(토큰 필수) 유지
-- 버전 3을 Default로 설정
-- ASG Desired/Min: 0 유지 (비용 절감, 테스트 시에만 1로 올릴 예정)
+3. IAM Role 생성
+   - Role 이름: project-ec2-role
+   - 연결 정책: AmazonS3ReadOnlyAccess, AmazonSQSFullAccess, CloudWatchAgentServerPolicy
+   - EC2가 S3에서 jar를 다운로드하고 SQS 메시지를 처리하기 위해 필요
+
+4. Launch Template 버전 3 생성 (최종본)
+   - IAM instance profile: project-ec2-role 연결
+   - User Data:
+     * Java 21 (amazon-corretto-headless) 자동 설치
+     * S3에서 jar 자동 다운로드
+     * 환경변수 9개 export 후 nohup으로 백그라운드 실행
+   - IMDSv2: V2만 허용 (보안 강화, 토큰 필수)
+   - ASG Desired/Min: 0 유지 (비용 절감)
 
 --------------------------------------------------------------------------------
-[2026-06-05] 세션 2 — EC2 배포 디버깅 및 앱 실행
+[2026-06-05] 세션 2 — EC2 배포 디버깅 (총 5개 문제 해결)
 --------------------------------------------------------------------------------
 
-[S3 URI 오류 수정]
-- 이전 세션에서 User Data의 S3 버킷명이 잘못 설정되어 있었음
-  - 잘못된 버킷명: project-reservation-jar
-  - 실제 버킷명: project-reservation-jar-247448832103-ap-northeast-2-an
-- Launch Template 버전 5 생성: S3 URI 수정
-- ASG 0 → 1로 올려 새 인스턴스 기동 → 시스템 로그에서 S3 다운로드 성공 확인
+[문제 1: S3 다운로드 404 오류]
 
-[ALB 헬스체크 — unhealthy 디버깅]
-- 원인 1: spring-boot-starter-actuator 미포함
-  - /actuator/health 엔드포인트 자체가 없었음
-  - build.gradle에 spring-boot-starter-actuator 추가
-- 원인 2: SecurityConfig의 requiresChannel().anyRequest().requiresSecure()
-  - ALB가 HTTP로 헬스체크 → Spring Security가 302 리다이렉트 → unhealthy
-  - HTTPS는 CloudFront/ALB에서 이미 처리하므로 requiresChannel 제거
-- 재빌드(gradlew.bat bootJar) → S3 재업로드 → ASG 재시작
+증상:
+- EC2 인스턴스가 시작되고 Java 설치는 성공하지만
+  S3 jar 다운로드 단계에서 아래 오류 발생:
+  "fatal error: An error occurred (404) when calling the HeadObject operation:
+   Key "reservation-0.0.1-SNAPSHOT.jar" does not exist"
 
-[RDS 연결 실패]
-- app.log 확인 (Fleet Manager → Session Manager로 EC2 접속)
-  - 오류: Communications link failure / SocketTimeoutException
-  - EC2(서울, ap-northeast-2)에서 RDS(시드니, ap-southeast-2) 3306 포트 연결 불가
-- 원인: RDS가 실수로 시드니 리전에 생성되어 있었고 보안 그룹에 3306 규칙 없었음
-- 임시 조치: 시드니 RDS 보안 그룹에 MySQL/Aurora 3306 포트 0.0.0.0/0 인바운드 규칙 추가
-  - [주의] 추후 상우와 상의하여 RDS 서울 이전 또는 IP 제한으로 교체 필요
+원인 분석 과정:
+- 처음에는 IAM 권한 문제라고 판단 → IAM Role 정책 재확인했으나 정상
+- 그 다음 S3 리전 플래그 누락 의심 → --region ap-northeast-2 추가 (버전 4)했으나 동일 오류
+- S3 콘솔에서 실제 파일명과 버킷명 직접 확인 요청
+  → 실제 버킷명: project-reservation-jar-247448832103-ap-northeast-2-an
+  → User Data에는: project-reservation-jar (잘못된 이름)
+- S3 버킷 생성 시 AWS가 계정 ID + 리전을 붙여 실제 버킷명을 자동 생성했는데
+  User Data에는 원래 의도한 짧은 이름만 입력되어 있었음
 
-[Redis TLS 연결 실패 해결]
-- app.log 분석: Redis 연결 타임아웃 (io.lettuce.core.RedisCommandTimeoutException)
-- 원인: ElastiCache에 전송 중 암호화(TLS) 필수 설정되어 있었으나 앱은 일반 연결 시도
-- openssl s_client 테스트로 TLS 연결 정상 확인 (CONNECTED, Verification: OK, TLSv1.2)
-- application.yml에 spring.data.redis.ssl.enabled: true 추가
-- 재빌드 → S3 재업로드 → ASG 재시작
+해결:
+- Launch Template 버전 5 생성
+- S3 URI를 정확한 버킷명으로 수정:
+  s3://project-reservation-jar-247448832103-ap-northeast-2-an/reservation-0.0.1-SNAPSHOT.jar
+- 이후 시스템 로그에서 S3 다운로드 성공 확인
+
+[문제 2: ALB Target Group unhealthy (헬스체크 실패)]
+
+증상:
+- S3 다운로드 성공, 앱 실행은 되는 것 같은데 ALB Target Group이 계속 unhealthy
+- 이로 인해 ASG가 해당 인스턴스를 비정상으로 판단하고 계속 교체하는 루프 발생
+
+원인 분석 과정 (3단계):
+
+단계 1 - 헬스체크 경로 문제 의심
+- ALB 헬스체크 경로가 /로 설정되어 있었음
+- /는 Spring Security의 anyRequest().authenticated()에 걸려 401 반환 가능
+- /actuator/health로 변경 시도 → 여전히 unhealthy
+
+단계 2 - Actuator 미포함 문제 발견
+- build.gradle 확인 결과 spring-boot-starter-actuator 의존성 자체가 없었음
+- /actuator/health 경로가 존재하지 않으므로 404 반환 → unhealthy
+- spring-boot-starter-actuator 추가 후 재빌드/재배포 → 여전히 unhealthy
+
+단계 3 - HTTPS 강제 설정 문제 발견
+- app.log를 직접 확인하기 위해 Fleet Manager → Session Manager 접속
+- 로그 확인: 앱은 정상 실행 중이었음
+- 분석: ALB는 EC2에 HTTP(8080)로 헬스체크를 보내는데,
+  SecurityConfig의 requiresChannel().anyRequest().requiresSecure() 설정이
+  모든 HTTP 요청을 HTTPS로 302 리다이렉트하고 있었음
+  → ALB가 302를 받으면 unhealthy로 판정
+- 근본 원인: HTTPS 강제는 CloudFront/ALB 레벨에서 이미 처리하고 있으므로
+  EC2 내부에서 중복으로 강제할 필요가 없었음
+- 해결: SecurityConfig에서 requiresChannel 블록 전체 제거
+- 재빌드/재배포 후 healthy 확인
+
+[문제 3: RDS 연결 실패 (크로스 리전 접속 불가)]
+
+증상 (app.log):
+- "Communications link failure"
+- "java.net.SocketTimeoutException: Connect timed out"
+- Hibernate가 SessionFactory 초기화 중 DB 연결 시도에서 타임아웃
+
+원인 분석 과정:
+
+단계 1 - EC2 접속 방법 탐색
+- SSH 접속 시도: EC2가 프라이빗 서브넷에 있어 퍼블릭 IP 없음 → 접속 불가
+- SSM Session Manager 시도: SSM Agent가 "no valid credentials" 오류
+  → 원인: 프라이빗 서브넷에 NAT Gateway는 있으나 SSM VPC 엔드포인트 없음
+  → 해결: IAM Role에 AmazonSSMManagedInstanceCore 정책 추가 후 재시도했으나 여전히 오프라인
+- Fleet Manager 시도 → 성공적으로 터미널 세션 접속 가능
+
+단계 2 - 로그 분석
+- sudo tail -100 /home/ec2-user/app.log 실행
+- SocketTimeoutException 확인
+- RDS 엔드포인트 확인: reservation.c9iqgkqq2vql.ap-southeast-2.rds.amazonaws.com
+  → ap-southeast-2는 시드니 리전!
+- EC2는 서울(ap-northeast-2), RDS는 시드니(ap-southeast-2) → 크로스 리전 연결
+
+단계 3 - 근본 원인 파악
+- RDS 생성 시 팀원이 실수로 시드니 리전에 생성
+- 시드니 RDS 보안 그룹에 3306 포트 인바운드 규칙이 없었음
+- 크로스 리전이라 EC2 보안 그룹 참조 불가 → 0.0.0.0/0으로 임시 개방
+
+해결 (임시):
+- 시드니 RDS 보안 그룹에 MySQL/Aurora 3306 포트 0.0.0.0/0 인바운드 규칙 추가
+- [보안 주의] 이후 상우와 협의하여 RDS 서울 이전 또는 IP 제한으로 교체 필요
+
+[문제 4: Redis(ElastiCache) 연결 실패 (TLS 미설정)]
+
+증상 (app.log):
+- "Unable to connect to master.project-reservation-redis.nm3ono.apn2.cache.amazonaws.com/<unresolved>:6379"
+- "io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 3 second(s)"
+- RDS 연결 성공 후 앱은 기동되었으나 스케줄러에서 Redis 연결 실패 반복
+
+원인 분석 과정:
+
+단계 1 - 보안 그룹 문제 의심
+- EC2 보안 그룹 확인: 인바운드 6379 from 10.0.0.0/8 규칙 존재
+- ElastiCache 보안 그룹 확인: 동일하게 6379 from 10.0.0.0/8 존재
+- 보안 그룹은 정상으로 보였으나 여전히 연결 실패
+
+단계 2 - DNS 해석 문제 의심
+- <unresolved> 키워드 주목
+- nslookup 실행: 정상적으로 10.0.129.216으로 해석됨 → DNS 문제 아님
+
+단계 3 - 네트워크 연결 테스트
+- nc -zv 명령어: not found
+- bash TCP 테스트: timeout 5 bash -c 'cat < /dev/tcp/10.0.129.216/6379' → 연결 실패
+- 같은 VPC임에도 TCP 연결 자체가 실패
+
+단계 4 - ElastiCache 보안 그룹 재확인
+- 소스를 CIDR(10.0.0.0/8) 대신 EC2 보안 그룹 ID(sg-0d4f24a1513fcc372)로 변경
+- 여전히 연결 실패
+
+단계 5 - ElastiCache 설정 확인
+- ElastiCache 클러스터 상세 설정 확인
+- "In-transit encryption: 활성화됨, 전송 암호화 모드: 필수(required)" 발견
+- ElastiCache가 TLS 연결만 허용하는데 앱은 일반 TCP로 연결 시도하고 있었음
+- bash TCP 테스트가 실패했던 이유: ElastiCache가 TLS 아닌 연결을 즉시 끊어버림
+
+단계 6 - TLS 연결 테스트로 가설 검증
+```
+openssl s_client -connect master.project-reservation-redis.nm3ono.apn2.cache.amazonaws.com:6379
+→ CONNECTED, Verification: OK, TLSv1.2, Cipher: ECDHE-RSA-AES128-GCM-SHA256
+```
+→ TLS 연결은 완벽하게 성공 → 네트워크/보안 그룹은 정상, TLS 설정 누락이 원인
+
+해결:
+- application.yml에 SSL 설정 추가:
+  spring.data.redis.ssl.enabled: true
+- 재빌드/재배포 후 Redis 연결 성공
 
 [배포 최종 성공]
 - Started ReservationApplication in 25.322 seconds
-- HikariPool-1 (RDS) 연결 성공
-- SQS Listener 컨테이너 2개 정상 시작
-- ALB Target Group → healthy 확인
-- 문제 해결 요약:
-  1. S3 버킷명 오류 수정 (Launch Template v5)
-  2. spring-boot-starter-actuator 추가 (/actuator/health 엔드포인트)
-  3. SecurityConfig requiresChannel 제거 (ALB HTTP 헬스체크 302 리다이렉트 문제)
-  4. 시드니 RDS 보안 그룹 3306 포트 0.0.0.0/0 개방
-  5. Redis SSL 설정 추가 (spring.data.redis.ssl.enabled: true)
+- HikariPool-1 (RDS 연결 풀) Start completed
+- SQS Listener 컨테이너 2개 정상 시작 (waiting-process-queue, lifecycle-hook-queue)
+- ALB Target Group → healthy
+
+[문제 해결 종합 요약]
+총 5개 문제를 순차적으로 해결하여 배포 완료:
+1. S3 버킷명 오류: User Data의 버킷명을 실제 AWS 생성 버킷명으로 수정 (v5)
+2. Actuator 미포함: spring-boot-starter-actuator 추가 → /actuator/health 엔드포인트 생성
+3. HTTPS 강제 설정: requiresChannel 제거 → ALB HTTP 헬스체크 정상화
+4. RDS 크로스 리전: 시드니 RDS 보안 그룹 3306 개방 (임시 조치)
+5. Redis TLS 미설정: spring.data.redis.ssl.enabled: true 추가
 
 --------------------------------------------------------------------------------
-[2026-06-06] 세션 3 — SES 연동 및 Grafana 대시보드 구성
+[2026-06-06] 세션 3 — SES 이메일 연동 및 Grafana 모니터링 구성
 --------------------------------------------------------------------------------
 
 [AWS SES 이메일 발송 연동]
-- SES 샌드박스 상태 확인 (ap-northeast-2, 잔여 200건)
-- twinf1004@hufs.ac.kr SES Verified Identity 등록
-- build.gradle: spring-cloud-aws-starter-ses 추가
-- EmailVerificationController: System.out.println → MailSender(SES) 실제 발송으로 교체
-- SecurityConfig: REST API CSRF 비활성화 (Spring Security 6 CSRF 토큰 방식 변경으로 인한 403 문제 해결)
-  - HMAC 토큰으로 대체하므로 보안 영향 없음
-- IAM project-ec2-role에 AmazonSESFullAccess 정책 추가
-- 인증 코드 이메일 발송 테스트 성공
 
-[Grafana Cloud + CloudWatch 연동]
-- Grafana Cloud 계정 생성 (ap-northeast-1 리전)
-- IAM 사용자 grafana-cloudwatch 생성 (CloudWatchReadOnlyAccess 정책)
-- Grafana → CloudWatch 데이터소스 연결 성공
-- 대시보드 '프로젝트 모니터링' 생성:
-  - EC2 CPU 사용률 (AWS/EC2, CPUUtilization, project-asg)
-  - ALB 요청 수 (AWS/ApplicationELB, RequestCount, project-alb)
-  - ALB 응답 시간 (AWS/ApplicationELB, TargetResponseTime, project-alb)
+배경:
+- EmailVerificationController에 System.out.println으로 임시 처리된 이메일 발송 로직을
+  실제 AWS SES 발송으로 교체
+
+구현 과정:
+
+단계 1 - 의존성 추가 및 코드 작성
+- build.gradle: spring-cloud-aws-starter-ses (3.1.1) 추가
+- EmailVerificationController에 SimpleEmailServiceMailSender 주입
+- System.out.println → SimpleMailMessage + mailSender.send() 로 교체
+- IAM project-ec2-role에 AmazonSESFullAccess 정책 추가
+- SES Verified Identity에 twinf1004@hufs.ac.kr 등록 (샌드박스 환경)
+
+문제 1: SimpleEmailServiceMailSender 빈 생성 실패
+- 증상 (app.log):
+  "No qualifying bean of type 'io.awspring.cloud.ses.SimpleEmailServiceMailSender' available"
+- 원인: Spring Cloud AWS 3.x에서 SES 자동 구성이 해당 타입의 빈을 직접 등록하지 않음
+- 해결: 주입 타입을 SimpleEmailServiceMailSender → MailSender 인터페이스로 변경
+  (Spring Cloud AWS가 MailSender 타입으로 빈을 등록하므로 정상 주입됨)
+
+문제 2: SES API 호출 시 403 Forbidden
+- 증상: curl로 /api/email/send 호출 시 HTTP 403
+- 원인 분석:
+  - Spring Security CSRF 보호가 활성화되어 있어 POST 요청에 CSRF 토큰 필요
+  - 첫 GET 요청으로 CSRF 토큰 획득 후 X-XSRF-TOKEN 헤더에 포함하여 재요청
+  - 여전히 403 반환
+  - 원인: Spring Security 6에서 CSRF 토큰 방식이 변경됨
+    기존: 쿠키 값 = 헤더 값이면 통과
+    변경: XOR 마스킹된 토큰을 사용하므로 쿠키 원본값을 헤더에 그대로 전송하면 검증 실패
+- 근본적 해결: REST API는 stateless 구조이므로 CSRF 보호가 불필요
+  (CSRF는 브라우저 세션 기반 공격에 대한 방어인데, 이 API는 HMAC 토큰으로 인증)
+  SecurityConfig에서 .csrf(csrf -> csrf.disable())으로 변경
+
+결과:
+- curl 테스트 성공: {"message":"Verification code sent","expiresIn":"5 minutes"}
+- twinf1004@hufs.ac.kr 수신함에 인증 코드 이메일 정상 수신 확인
+
+[Grafana Cloud + CloudWatch 모니터링 연동]
+
+목적:
+- Auto Scaling 동작 시 CPU, 트래픽, 응답 시간을 실시간으로 시각화
+- 성능 테스트 진행 시 Grafana 대시보드로 모니터링
+
+구성 과정:
+1. Grafana Cloud 계정 생성 (ap-northeast-1 리전 선택, 무료 플랜)
+2. IAM 사용자 grafana-cloudwatch 생성
+   - 정책: CloudWatchReadOnlyAccess
+   - 액세스 키 발급 (Grafana 전용 최소 권한 원칙 적용)
+3. Grafana → Connections → CloudWatch 데이터소스 추가
+   - 인증: 액세스 키 방식
+   - Default Region: ap-northeast-2
+   - Save & test → metrics API, logs API 모두 정상 확인
+4. 대시보드 '프로젝트 모니터링' 생성 (패널 3개):
+   - EC2 CPU 사용률: AWS/EC2, CPUUtilization, Average, AutoScalingGroupName=project-asg
+   - ALB 요청 수: AWS/ApplicationELB, RequestCount, Sum, LoadBalancer=app/project-alb/...
+   - ALB 응답 시간: AWS/ApplicationELB, TargetResponseTime, Average, LoadBalancer=app/project-alb/...
 
 [미완료 항목]
-- ASG Lifecycle Hook: 상우 담당, 수명주기 후크 미설정 상태 → 추후 상우와 협의
+- ASG Lifecycle Hook: 상우 담당 코드와 연관, 수명주기 후크 미설정 상태
+  → 상우와 협의 후 설정 예정
+  → EC2 실행 시 Queue① 활성화, 종료 시 Queue① 비활성화 흐름 확인 필요
+
+[성능 테스트 준비 완료]
+- ASG 설정: Target Tracking Policy, CPU 70% 기준, Min 0 / Max 10
+- 팀에 공유한 사항:
+  1. 부하 테스트 도구 결정 필요 (JMeter / k6 / nGrinder)
+  2. 상우 - Lifecycle Hook 설정 필요
+  3. 성능 테스트 시 ASG 1로 올린 뒤 진행, 완료 후 0으로 내리기
+
+[보안 미완료 사항 — 추후 처리 필요]
+- 시드니 RDS 보안 그룹 0.0.0.0/0 개방 중 (임시 조치)
+  → 상우와 협의하여 서울(ap-northeast-2)로 RDS 이전 권장
+  → 이전 어려울 경우 NAT Gateway EIP만 허용하도록 보안 그룹 수정
 
 ================================================================================
