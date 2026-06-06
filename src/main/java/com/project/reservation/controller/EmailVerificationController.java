@@ -2,6 +2,8 @@ package com.project.reservation.controller;
 
 import com.project.reservation.service.EmailVerificationService;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mail.MailSender;
+import org.springframework.mail.SimpleMailMessage;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
@@ -11,9 +13,12 @@ import java.util.Map;
 public class EmailVerificationController {
 
     private final EmailVerificationService emailVerificationService;
+    private final MailSender mailSender;
 
-    public EmailVerificationController(EmailVerificationService emailVerificationService) {
+    public EmailVerificationController(EmailVerificationService emailVerificationService,
+                                       MailSender mailSender) {
         this.emailVerificationService = emailVerificationService;
+        this.mailSender = mailSender;
     }
 
     // 이메일 인증 코드 발송 요청
@@ -38,8 +43,13 @@ public class EmailVerificationController {
         String code = String.valueOf((int)(Math.random() * 900000) + 100000);
         emailVerificationService.saveVerificationCode(email, code);
 
-        // TODO: AWS SES로 실제 이메일 발송 연동
-        System.out.println("[EMAIL] 인증 코드 발송 → " + email + " : " + code);
+        // AWS SES 이메일 발송
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom("twinf1004@hufs.ac.kr");
+        message.setTo(email);
+        message.setSubject("[예약 시스템] 이메일 인증 코드");
+        message.setText("인증 코드: " + code + "\n\n유효 시간: 5분");
+        mailSender.send(message);
 
         return ResponseEntity.ok(Map.of(
             "message", "Verification code sent",
