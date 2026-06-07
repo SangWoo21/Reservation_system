@@ -31,4 +31,14 @@ public class ReservationController {
     public ResponseEntity<List<SeatResponse>> getAvailableSeats() {
         return ResponseEntity.ok(reservationService.getAvailableSeats());
     }
+
+    // 예약 결과 조회 (대기열 비동기 처리 확인용)
+    @GetMapping("/status")
+    public ResponseEntity<ReservationResponse> getStatus(@RequestParam String userId) {
+        ReservationResponse response = reservationService.getReservationStatus(userId);
+        if (response == null) {
+            return ResponseEntity.status(404).build();
+        }
+        return ResponseEntity.ok(response);
+    }
 }

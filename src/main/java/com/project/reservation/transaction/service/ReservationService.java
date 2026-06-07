@@ -22,19 +22,15 @@ public class ReservationService {
 
     private final SeatRepository seatRepository;
     private final ReservationRepository reservationRepository;
+    private final org.springframework.data.redis.core.RedisTemplate<String, String> redisTemplate;
 
     @Transactional(timeout = 5)
     public ReservationResponse reserve(String userId, Long seatId) {
-
-        // 1. 비관적 락으로 좌석 조회 (SELECT FOR UPDATE)
+        // ... (existing code unchanged for now, but will use the same notification logic if needed)
         Seat seat = seatRepository.findByIdWithLock(seatId)
                 .orElseThrow(() ->
                         new IllegalArgumentException("존재하지 않는 좌석: " + seatId));
-
-        // 2. 예약 처리 (이미 예약된 경우 예외 발생)
         seat.reserve();
-
-        // 3. 예약 저장
         Reservation reservation = Reservation.create(userId, seat);
         reservationRepository.save(reservation);
 
@@ -46,15 +42,36 @@ public class ReservationService {
     @Transactional(timeout = 5)
     public ReservationResponse reserveAutoAssign(String userId) {
         if (reservationRepository.existsByUserId(userId)) {
-            throw new IllegalArgumentException("이미 예약하셨습니다: " + userId);
+            return ReservationResponse.success(0L, "ALREADY_RESERVED");
         }
         Seat seat = seatRepository.findFirstAvailableWithLock()
                 .orElseThrow(() -> new IllegalArgumentException("예약 가능한 좌석이 없습니다."));
         seat.reserve();
         Reservation reservation = Reservation.create(userId, seat);
         reservationRepository.save(reservation);
+        
+        // Redis에 알림 저장 (10분 유효)
+        String noticeKey = com.project.reservation.common.RedisConstants.RESERVATION_NOTIFICATION + userId;
+        redisTemplate.opsForValue().set(noticeKey, seat.getSeatCode(), 10, java.util.concurrent.TimeUnit.MINUTES);
+
         log.info("자동 배정 예약 성공 - userId: {}, seatCode: {}", userId, seat.getSeatCode());
         return ReservationResponse.success(reservation.getId(), seat.getSeatCode());
+    }
+
+    @Transactional(readOnly = true)
+    public ReservationResponse getReservationStatus(String userId) {
+        // 1. Redis 알림 확인 (빠른 응답)
+        String noticeKey = com.project.reservation.common.RedisConstants.RESERVATION_NOTIFICATION + userId;
+        String seatCode = redisTemplate.opsForValue().get(noticeKey);
+        
+        if (seatCode != null) {
+            return ReservationResponse.success(null, seatCode);
+        }
+
+        // 2. DB 확인 (Redis 만료 등의 경우 대비)
+        return reservationRepository.findByUserId(userId)
+                .map(r -> ReservationResponse.success(r.getId(), r.getSeat().getSeatCode()))
+                .orElse(null);
     }
 
     // 예약 가능 좌석 목록

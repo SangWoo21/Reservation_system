@@ -23,6 +23,9 @@ public class Queue1Service {
     @Value("${queue1.ttl-minutes:3}")
     private long ttlMinutes;
 
+    @Value("${queue1.max-capacity:10000}")
+    private long maxCapacity;
+
     public boolean isActive() {
         return Boolean.TRUE.equals(redisTemplate.hasKey(RedisConstants.QUEUE1_ACTIVE_KEY));
     }
@@ -52,7 +55,35 @@ public class Queue1Service {
     }
 
     public WaitingsApiResponse<?> enqueue(String userId) {
-        redisTemplate.opsForZSet().add(RedisConstants.QUEUE1, userId, System.currentTimeMillis());
+        String script =
+            "if tonumber(redis.call('ZCARD', KEYS[1])) >= tonumber(ARGV[2]) then " +
+            "  return 'FULL' " +
+            "end " +
+            "local added = redis.call('ZADD', KEYS[1], 'NX', ARGV[1], ARGV[3]) " +
+            "if added == 0 then " +
+            "  return 'DUPLICATE' " +
+            "end " +
+            "return 'SUCCESS'";
+
+        String result = redisTemplate.execute(
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>(script, String.class),
+            java.util.Collections.singletonList(RedisConstants.QUEUE1),
+            String.valueOf(System.currentTimeMillis()),
+            String.valueOf(maxCapacity),
+            userId
+        );
+
+        if ("FULL".equals(result)) {
+            log.warn("[Queue1] 정원 초과 (userId={})", userId);
+            return WaitingsApiResponse.fail("대기열이 꽉 찼습니다. 잠시 후 다시 시도해주세요.");
+        }
+
+        if ("DUPLICATE".equals(result)) {
+            log.info("[Queue1] 중복 요청 방지 (userId={})", userId);
+            Long rank = redisTemplate.opsForZSet().rank(RedisConstants.QUEUE1, userId);
+            return WaitingsApiResponse.success("이미 대기열에 등록되어 있습니다.", Map.of("position", rank == null ? 1 : rank + 1));
+        }
+
         Long rank = redisTemplate.opsForZSet().rank(RedisConstants.QUEUE1, userId);
         log.info("[Queue1] 진입 userId={}", userId);
         return WaitingsApiResponse.success("요청이 접수되었습니다.", Map.of("position", rank == null ? 1 : rank + 1));

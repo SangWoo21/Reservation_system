@@ -6,4 +6,8 @@ public class RedisConstants {
     public static final String QUEUE1 = "queue1";
     public static final String QUEUE1_ACTIVE_KEY = "queue1:active";
     public static final String QUEUE1_AUTO_ENABLED_KEY = "queue1:auto-enabled";
+    
+    public static final String QUEUE1_TOKEN_BUCKET = "queue1:token-bucket";
+    
+    public static final String RESERVATION_NOTIFICATION = "reservation:notification:";
 }
