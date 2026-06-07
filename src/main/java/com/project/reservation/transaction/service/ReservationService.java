@@ -45,6 +45,9 @@ public class ReservationService {
     // 대기열 방식 — 빈 좌석 자동 배정 (1개 행만 락)
     @Transactional(timeout = 5)
     public ReservationResponse reserveAutoAssign(String userId) {
+        if (reservationRepository.existsByUserId(userId)) {
+            throw new IllegalArgumentException("이미 예약하셨습니다: " + userId);
+        }
         Seat seat = seatRepository.findFirstAvailableWithLock()
                 .orElseThrow(() -> new IllegalArgumentException("예약 가능한 좌석이 없습니다."));
         seat.reserve();

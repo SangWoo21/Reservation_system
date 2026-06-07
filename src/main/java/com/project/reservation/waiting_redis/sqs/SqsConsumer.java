@@ -27,6 +27,8 @@ public class SqsConsumer {
             log.info("[Consumer] userId={} 예약 처리 완료", userId);
         } catch (SeatAlreadyReservedException e) {
             log.warn("[Consumer] 이미 예약된 좌석, 메시지 무시 userId={}", userId);
+        } catch (IllegalArgumentException e) {
+            log.warn("[Consumer] 메시지 무시 userId={}, reason={}", userId, e.getMessage());
         }
         // 그 외 예외(DB 오류, 네트워크 등)는 rethrow → SQS가 재시도(maxReceiveCount=3) 후 DLQ
     }

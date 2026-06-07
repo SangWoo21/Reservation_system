@@ -90,17 +90,27 @@ public class WaitingService {
     public WaitingsApiResponse<?> confirmReservation(String userId) {
         String activeKey = "active_user:" + userId;
 
-        // 입장권 확인
-        if (!Boolean.TRUE.equals(redisTemplate.hasKey(activeKey))) {
+        // 입장권 확인 + 삭제를 원자적으로 처리 (TOCTOU 방지)
+        String atomicCheckAndDelete =
+            "if redis.call('EXISTS', KEYS[1]) == 1 then" +
+            "    redis.call('DEL', KEYS[1])" +
+            "    return 1" +
+            "else" +
+            "    return 0" +
+            "end";
+
+        Long deleted = redisTemplate.execute(
+            new DefaultRedisScript<>(atomicCheckAndDelete, Long.class),
+            List.of(activeKey)
+        );
+
+        if (deleted == null || deleted == 0L) {
             return WaitingsApiResponse.fail("입장 권한이 없거나 시간이 초과되었습니다.");
         }
 
         // SQS 발행 → Consumer → 자동 배정
         sqsTemplate.send(queueUrl, userId);
-
-        // 중복 제출 방지
-        redisTemplate.delete(activeKey);
-
+        
         log.info("{} 님 Form 제출 완료, 예약 처리 중", userId);
         return WaitingsApiResponse.success("예약 요청이 완료되었습니다.");
     }
