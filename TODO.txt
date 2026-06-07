@@ -72,9 +72,11 @@
       - spring-cloud-aws-starter-ses 의존성 추가
       - EmailVerificationController의 System.out.println → SES 발송으로 교체
       - twinf1004@hufs.ac.kr Verified Identity 등록, 발송 테스트 성공
-[ ] ASG Lifecycle Hook 연동 확인 — 상우 담당, 미설정 상태
-      - EC2_INSTANCE_LAUNCHING → lifecycle-hook-queue → Queue① 활성화 동작 확인
-      - EC2_INSTANCE_TERMINATING → Queue① 비활성화 동작 확인
+[완료] ASG Lifecycle Hook 연동 확인
+      - launch-hook: LifecycleHookInitializer가 앱 시작 시 CONTINUE 전송 (타임아웃 120초)
+      - terminate-hook: Lambda(lifecycle-hook-terminate)가 SQS 수신 후 CONTINUE 전송
+      - GracefulShutdown: Queue1 deactivate → 5초 대기 → Lambda CONTINUE → SIGTERM 순서 보장
+      - Lambda ValidationError 예외 처리 추가 (스테일 메시지 [SKIP] 후 정상 반환)
 [완료] CloudWatch + Grafana 연동
       - Grafana Cloud 계정 생성, CloudWatch 데이터소스 연결
       - 대시보드 '프로젝트 모니터링' 생성 (EC2 CPU, ALB 요청 수, ALB 응답 시간)
